@@ -1,0 +1,42 @@
+services:
+  trading-bot:
+    build: .
+    container_name: bybit-spot-bot
+    restart: unless-stopped
+    environment:
+      - DB_HOST=postgres
+      - DB_PORT=5432
+      - DB_NAME=bybit_bot
+      - DB_USER=trader
+      - DB_PASSWORD=trading_password
+    volumes:
+      - ./.env:/app/.env:ro
+      - bot_data:/app/data
+    depends_on:
+      - postgres
+    networks:
+      - trading-network
+
+  postgres:
+    image: postgres:15
+    container_name: trading-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: bybit_bot
+      POSTGRES_USER: trader
+      POSTGRES_PASSWORD: trading_password
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./init-db.sql:/docker-entrypoint-initdb.d/init-db.sql
+    networks:
+      - trading-network
+
+volumes:
+  postgres_data:
+  bot_data:
+
+networks:
+  trading-network:
+    driver: bridge

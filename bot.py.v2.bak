@@ -1,0 +1,900 @@
+import json
+import logging
+import math
+import os
+import time
+from datetime import datetime, timedelta
+from decimal import Decimal
+
+import ccxt
+import psycopg2
+from dotenv import load_dotenv
+
+# Настройка логирования
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+logger = logging.getLogger(__name__)
+
+load_dotenv()
+
+
+class BybitSpotBot:
+    def __init__(self):
+        self.exchange = ccxt.bybit(
+            {
+                "apiKey": os.getenv("BYBIT_API_KEY"),
+                "secret": os.getenv("BYBIT_API_SECRET"),
+                "enableRateLimit": True,
+                "sandbox": False,
+                "rateLimit": 100,
+            }
+        )
+
+        try:
+            markets = self.exchange.load_markets()
+            logger.info(f"✅ Успешно подключено к Bybit. Доступно пар: {len(markets)}")
+
+            # ДИАГНОСТИКА РЫНКОВ
+            spot_usdt_pairs = [
+                sym
+                for sym in markets.keys()
+                if markets[sym].get("spot") and "USDT" in sym
+            ]
+            logger.info(f"🔍 Найдено спотовых USDT пар: {len(spot_usdt_pairs)}")
+            if spot_usdt_pairs:
+                logger.info("📊 Примеры спотовых пар:")
+                for symbol in spot_usdt_pairs[:5]:
+                    logger.info(f"   {symbol}")
+
+        except Exception as e:
+            logger.error(f"❌ Ошибка подключения к Bybit: {e}")
+            raise
+
+        # Конфигурация
+        self.total_capital = Decimal("50")
+        self.min_order = Decimal("5")
+        self.commission = Decimal("0.001")
+        self.max_positions = 3
+        self.position_size = Decimal("12")
+        self.reserve_cash = Decimal("8")
+
+        # Защитные параметры
+        self.stop_loss = Decimal("0.98")
+        self.take_profit = Decimal("1.03")
+        self.trailing_stop = Decimal("0.985")
+        self.max_hold_hours = 6
+
+        # Параметры БД
+        self.db_config = {
+            "host": os.getenv("DB_HOST", "postgres"),
+            "database": os.getenv("DB_NAME", "bybit_bot"),
+            "user": os.getenv("DB_USER", "trader"),
+            "password": os.getenv("DB_PASSWORD", "trading_password"),
+            "port": os.getenv("DB_PORT", "5432"),
+        }
+
+        # Кэширование данных для оптимизации
+        self.last_tickers_update = None
+        self.cached_tickers = {}
+        self.tickers_cache_ttl = 10
+        self.last_status_log = 0
+        self.status_log_interval = 60
+
+        # ИНИЦИАЛИЗАЦИЯ БД И ПОРТФЕЛЯ В ПРАВИЛЬНОМ ПОРЯДКЕ
+        self.db_conn = self.init_db()
+
+        # Теперь, когда db_conn установлен, можно логировать портфель
+        if self.db_conn:
+            self.log_initial_portfolio()
+        else:
+            logger.warning(
+                "⚠️ База данных не доступна, работаем без сохранения состояния"
+            )
+
+    def init_db(self):
+        """Инициализация PostgreSQL соединения - ТОЛЬКО создание соединения"""
+        try:
+            conn = psycopg2.connect(**self.db_config)
+            with conn.cursor() as cur:
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS portfolio (
+                        id SERIAL PRIMARY KEY,
+                        symbol VARCHAR(50) NOT NULL,
+                        quantity DECIMAL(20,8) NOT NULL,
+                        entry_price DECIMAL(20,8) NOT NULL,
+                        current_price DECIMAL(20,8),
+                        entry_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        profit_loss DECIMAL(10,4),
+                        status VARCHAR(10) DEFAULT 'active'
+                    )
+                """)
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS transactions (
+                        id SERIAL PRIMARY KEY,
+                        symbol VARCHAR(50) NOT NULL,
+                        side VARCHAR(10) NOT NULL,
+                        quantity DECIMAL(20,8) NOT NULL,
+                        price DECIMAL(20,8) NOT NULL,
+                        fee DECIMAL(20,8),
+                        total DECIMAL(20,8) NOT NULL,
+                        timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )
+                """)
+            conn.commit()
+            logger.info("✅ База данных инициализирована")
+            return conn
+
+        except Exception as e:
+            logger.error(f"❌ Ошибка подключения к БД: {e}")
+            return None
+
+    def log_initial_portfolio(self):
+        """Логирование начального состояния портфеля"""
+        try:
+            portfolio = self.get_current_portfolio()
+            balance = self.get_usdt_balance()
+
+            logger.info("📊 НАЧАЛЬНОЕ СОСТОЯНИЕ ПОРТФЕЛЯ:")
+            logger.info(f"💰 Баланс USDT: {balance}")
+            logger.info(f"📦 Позиций в портфеле: {len(portfolio)}")
+
+            if portfolio:
+                logger.info("🔍 Детали портфеля:")
+                total_value = Decimal("0")
+                for symbol, position in portfolio.items():
+                    current_price = position.get("current_price", Decimal("0"))
+                    quantity = position["quantity"]
+                    value = quantity * current_price
+                    total_value += value
+                    logger.info(
+                        f"   {symbol}: {quantity} × {current_price} = {value:.2f} USDT"
+                    )
+
+                logger.info(f"📈 Общая стоимость портфеля: {total_value:.2f} USDT")
+            else:
+                logger.info("💡 Портфель пуст")
+
+        except Exception as e:
+            logger.error(f"❌ Ошибка логирования начального портфеля: {e}")
+
+    def get_cached_tickers(self):
+        """Получение тикеров с кэшированием и логированием обновления"""
+        current_time = time.time()
+
+        if (
+            self.last_tickers_update is None
+            or current_time - self.last_tickers_update > self.tickers_cache_ttl
+            or not self.cached_tickers
+        ):
+            try:
+                old_count = len(self.cached_tickers)
+                self.cached_tickers = self.enhanced_fetch_filtered_tickers()
+                self.last_tickers_update = current_time
+
+                new_count = len(self.cached_tickers)
+                logger.debug(f"🔄 Обновлен кэш тикеров: {old_count} -> {new_count} пар")
+
+            except Exception as e:
+                logger.error(f"❌ Ошибка обновления кэша тикеров: {e}")
+
+        return self.cached_tickers
+
+    def enhanced_fetch_filtered_tickers(self):
+        """РАСШИРЕННЫЙ мониторинг ВСЕХ пар с улучшенной фильтрацией"""
+        try:
+            tickers = self.exchange.fetch_tickers()
+            logger.info(f"📈 Загружено тикеров: {len(tickers)}")
+
+            filtered = {}
+            categories = {
+                "low_cap": [],  # < 1 USDT
+                "mid_cap": [],  # 1-50 USDT
+                "high_cap": [],  # > 50 USDT
+                "meme": [],  # Высокая волатильность
+                "defi": [],  # DeFi токены
+                "ai": [],  # AI токены
+            }
+
+            for symbol, ticker in tickers.items():
+                if "/USDT:USDT" in symbol:
+                    try:
+                        price = (
+                            Decimal(str(ticker.get("last", 0)))
+                            if ticker.get("last")
+                            else Decimal("0")
+                        )
+                        volume = (
+                            Decimal(str(ticker.get("baseVolume", 0)))
+                            if ticker.get("baseVolume")
+                            else Decimal("0")
+                        )
+                        change_24h = (
+                            Decimal(str(ticker.get("percentage", 0)))
+                            if ticker.get("percentage")
+                            else Decimal("0")
+                        )
+
+                        # РАСШИРЕННЫЕ ФИЛЬТРЫ
+                        price_ok = price > Decimal("0.0001") and price <= Decimal(
+                            "100"
+                        )  # Увеличил до 100 USDT
+                        volume_ok = volume >= Decimal("10000")  # Больше ликвидности
+                        change_ok = change_24h > Decimal(
+                            "-80"
+                        ) and change_24h < Decimal("1000")  # Шире диапазон
+
+                        # КАТЕГОРИЗАЦИЯ
+                        base_symbol = symbol.replace("/USDT:USDT", "USDT")
+
+                        if price_ok and volume_ok and change_ok:
+                            # УЛУЧШЕННЫЙ СКОРИНГ
+                            enhanced_score = self.calculate_enhanced_growth_score(
+                                {
+                                    "price": price,
+                                    "volume": volume,
+                                    "change_24h": change_24h,
+                                    "symbol": base_symbol,
+                                }
+                            )
+
+                            filtered[base_symbol] = {
+                                "price": price,
+                                "volume": volume,
+                                "change_24h": change_24h,
+                                "symbol": base_symbol,
+                                "original_symbol": symbol,
+                                "score": enhanced_score,
+                                "category": self.categorize_asset(
+                                    base_symbol, price, volume, change_24h
+                                ),
+                            }
+
+                            # Распределение по категориям
+                            if price < Decimal("1"):
+                                categories["low_cap"].append(base_symbol)
+                            elif price < Decimal("50"):
+                                categories["mid_cap"].append(base_symbol)
+                            else:
+                                categories["high_cap"].append(base_symbol)
+
+                            # Дополнительные категории по названию
+                            if any(
+                                keyword in base_symbol.upper()
+                                for keyword in ["FLOKI", "SHIB", "BONK", "PEPE", "DOGE"]
+                            ):
+                                categories["meme"].append(base_symbol)
+                            if any(
+                                keyword in base_symbol.upper()
+                                for keyword in ["UNI", "AAVE", "COMP", "MKR", "CRV"]
+                            ):
+                                categories["defi"].append(base_symbol)
+                            if any(
+                                keyword in base_symbol.upper()
+                                for keyword in ["AI", "AGIX", "FET", "OCEAN", "NMR"]
+                            ):
+                                categories["ai"].append(base_symbol)
+
+                    except Exception as e:
+                        continue
+
+            # ЛОГИРОВАНИЕ СТАТИСТИКИ
+            logger.info("🎯 СТАТИСТИКА РЫНКА:")
+            logger.info(
+                f"   Низкая капитализация (<1$): {len(categories['low_cap'])} пар"
+            )
+            logger.info(
+                f"   Средняя капитализация (1-50$): {len(categories['mid_cap'])} пар"
+            )
+            logger.info(
+                f"   Высокая капитализация (>50$): {len(categories['high_cap'])} пар"
+            )
+            logger.info(f"   Meme токены: {len(categories['meme'])} пар")
+            logger.info(f"   DeFi токены: {len(categories['defi'])} пар")
+            logger.info(f"   AI токены: {len(categories['ai'])} пар")
+            logger.info(f"   ВСЕГО отфильтровано: {len(filtered)} пар")
+
+            return filtered
+
+        except Exception as e:
+            logger.error(f"❌ Ошибка расширенного мониторинга: {e}")
+            return {}
+
+    def calculate_enhanced_growth_score(self, ticker_data):
+        """Улучшенный расчет скора с учетом multiple факторов"""
+        try:
+            change = ticker_data["change_24h"]
+            volume = ticker_data["volume"]
+            price = ticker_data["price"]
+
+            # 1. Базовый скор на основе изменения цены
+            price_score = change * Decimal("2")
+
+            # 2. Объемный фактор (логарифмический)
+            volume_factor = Decimal(math.log(max(float(volume), 10000) / 10000))
+            volume_score = volume_factor * Decimal("5")
+
+            # 3. Фактор цены (преференция низкой цене)
+            price_factor = max(Decimal("0.5"), Decimal("2") - (price / Decimal("10")))
+
+            # 4. Волатильность penalty
+            volatility_penalty = Decimal("0")
+            if abs(change) > Decimal("50"):
+                volatility_penalty = (abs(change) - Decimal("50")) * Decimal("0.1")
+
+            # 5. Комиссионные издержки
+            commission_cost = self.commission * Decimal("200")
+
+            final_score = (
+                (price_score + volume_score) * price_factor
+                - volatility_penalty
+                - commission_cost
+            )
+            return final_score
+
+        except Exception as e:
+            logger.error(f"❌ Ошибка расчета улучшенного скора: {e}")
+            return Decimal("0")
+
+    def categorize_asset(self, symbol, price, volume, change_24h):
+        """Категоризация актива для диверсификации"""
+        # По цене
+        if price < Decimal("0.01"):
+            return "micro_cap"
+        elif price < Decimal("1"):
+            return "low_cap"
+        elif price < Decimal("10"):
+            return "mid_cap"
+        else:
+            return "high_cap"
+
+    def get_usdt_balance(self):
+        """Получение баланса USDT"""
+        try:
+            balance = self.exchange.fetch_balance()
+            usdt_balance = Decimal("0")
+
+            if "USDT" in balance:
+                if isinstance(balance["USDT"], dict):
+                    usdt_balance = Decimal(str(balance["USDT"].get("free", 0)))
+                else:
+                    usdt_balance = Decimal(str(balance["USDT"]))
+            elif "total" in balance and "USDT" in balance["total"]:
+                usdt_balance = Decimal(str(balance["total"]["USDT"]))
+
+            return usdt_balance
+
+        except Exception as e:
+            logger.error(f"❌ Ошибка получения баланса: {e}")
+            return Decimal("0")
+
+    def get_current_portfolio(self):
+        """Получение текущего портфеля из БД"""
+        portfolio = {}
+        if self.db_conn:
+            try:
+                with self.db_conn.cursor() as cur:
+                    cur.execute("""
+                        SELECT symbol, quantity, entry_price, entry_time, current_price
+                        FROM portfolio WHERE status = 'active'
+                    """)
+                    for row in cur.fetchall():
+                        symbol, quantity, entry_price, entry_time, current_price = row
+                        portfolio[symbol] = {
+                            "quantity": Decimal(str(quantity)),
+                            "entry_price": Decimal(str(entry_price)),
+                            "entry_time": entry_time,
+                            "current_price": Decimal(str(current_price))
+                            if current_price
+                            else Decimal("0"),
+                        }
+            except Exception as e:
+                logger.error(f"❌ Ошибка чтения портфеля: {e}")
+        return portfolio
+
+    def sync_portfolio_with_exchange(self):
+        """Синхронизация портфеля с биржей с логированием"""
+        try:
+            balance = self.exchange.fetch_balance()
+            db_portfolio = self.get_current_portfolio()
+            added_count = 0
+
+            logger.debug("🔄 Синхронизация портфеля с биржей...")
+
+            for currency, data in balance.items():
+                if currency in [
+                    "free",
+                    "used",
+                    "total",
+                    "info",
+                    "timestamp",
+                    "datetime",
+                ]:
+                    continue
+
+                if isinstance(data, dict):
+                    free_balance = Decimal(str(data.get("free", 0)))
+                    if free_balance > Decimal("0.0001") and currency != "USDT":
+                        symbol = f"{currency}USDT"
+
+                        if symbol not in db_portfolio:
+                            logger.info(
+                                f"📥 Обнаружена новая позиция на бирже: {symbol}"
+                            )
+
+                            try:
+                                ticker = self.exchange.fetch_ticker(symbol)
+                                current_price = (
+                                    Decimal(str(ticker["last"]))
+                                    if ticker.get("last")
+                                    else Decimal("0")
+                                )
+
+                                if current_price > Decimal("0") and self.db_conn:
+                                    with self.db_conn.cursor() as cur:
+                                        cur.execute(
+                                            """
+                                            INSERT INTO portfolio (symbol, quantity, entry_price, current_price)
+                                            VALUES (%s, %s, %s, %s)
+                                            """,
+                                            (
+                                                symbol,
+                                                float(free_balance),
+                                                float(current_price),
+                                                float(current_price),
+                                            ),
+                                        )
+                                    self.db_conn.commit()
+                                    logger.info(
+                                        f"✅ Добавлена позиция {symbol}: {free_balance} по цене {current_price}"
+                                    )
+                                    added_count += 1
+
+                            except Exception as e:
+                                logger.error(f"❌ Ошибка добавления {symbol}: {e}")
+
+            if added_count > 0:
+                logger.info(
+                    f"✅ Синхронизация завершена. Добавлено позиций: {added_count}"
+                )
+            else:
+                logger.debug("✅ Синхронизация завершена. Новых позиций не обнаружено")
+
+            return added_count > 0
+
+        except Exception as e:
+            logger.error(f"❌ Ошибка синхронизации портфеля: {e}")
+            return False
+
+    def update_portfolio_prices(self, tickers):
+        """Обновление текущих цен в портфеле"""
+        try:
+            if not self.db_conn:
+                return
+
+            updated_count = 0
+            with self.db_conn.cursor() as cur:
+                for symbol in tickers:
+                    if symbol in tickers:
+                        current_price = tickers[symbol]["price"]
+                        cur.execute(
+                            """
+                            UPDATE portfolio
+                            SET current_price = %s
+                            WHERE symbol = %s AND status = 'active'
+                            """,
+                            (float(current_price), symbol),
+                        )
+                        if cur.rowcount > 0:
+                            updated_count += 1
+
+                self.db_conn.commit()
+
+            return updated_count > 0
+
+        except Exception as e:
+            logger.error(f"❌ Ошибка обновления цен портфеля: {e}")
+            return False
+
+    def analyze_portfolio_diversification(self, portfolio, tickers):
+        """Анализ диверсификации текущего портфеля"""
+        categories_count = {
+            "micro_cap": 0,
+            "low_cap": 0,
+            "mid_cap": 0,
+            "high_cap": 0,
+            "meme": 0,
+            "defi": 0,
+            "ai": 0,
+        }
+
+        for symbol in portfolio:
+            if symbol in tickers:
+                category = tickers[symbol].get("category", "unknown")
+                categories_count[category] = categories_count.get(category, 0) + 1
+
+        logger.info("🎯 ДИВЕРСИФИКАЦИЯ ПОРТФЕЛЯ:")
+        for category, count in categories_count.items():
+            if count > 0:
+                logger.info(f"   {category}: {count} позиций")
+
+        return categories_count
+
+    def find_diversified_opportunities(self, tickers, portfolio, current_categories):
+        """Поиск возможностей с учетом диверсификации"""
+        opportunities = []
+
+        for symbol, data in tickers.items():
+            if symbol not in portfolio:
+                category = data.get("category", "unknown")
+                score = data["score"]
+                price = data["price"]
+
+                # БОНУС за недостающие категории
+                diversification_bonus = Decimal("0")
+                if current_categories.get(category, 0) == 0:
+                    diversification_bonus = Decimal("10")  # Бонус за новую категорию
+                elif current_categories.get(category, 0) <= 1:
+                    diversification_bonus = Decimal("5")  # Малый бонус
+
+                final_score = score + diversification_bonus
+                opportunities.append((symbol, final_score, price, category))
+
+        # Сортировка по итоговому скору
+        opportunities.sort(key=lambda x: x[1], reverse=True)
+        return opportunities[:5]  # Возвращаем топ-5
+
+    def check_stop_conditions(self, portfolio, tickers):
+        """Проверка стоп-условий в реальном времени"""
+        positions_to_sell = []
+
+        for symbol, position in portfolio.items():
+            if symbol in tickers:
+                current_price = tickers[symbol]["price"]
+                entry_price = position["entry_price"]
+                entry_time = position["entry_time"]
+
+                pnl_ratio = current_price / entry_price
+
+                # СТОП-ЛОСС
+                if pnl_ratio <= self.stop_loss:
+                    positions_to_sell.append(
+                        (symbol, position, current_price, "СТОП-ЛОСС")
+                    )
+                    continue
+
+                # ТЕЙК-ПРОФИТ
+                if pnl_ratio >= self.take_profit:
+                    positions_to_sell.append(
+                        (symbol, position, current_price, "ТЕЙК-ПРОФИТ")
+                    )
+                    continue
+
+                # ТРЕЙЛИНГ-СТОП
+                if pnl_ratio > Decimal("1.01") and pnl_ratio <= self.trailing_stop:
+                    positions_to_sell.append(
+                        (symbol, position, current_price, "ТРЕЙЛИНГ-СТОП")
+                    )
+                    continue
+
+                # ВРЕМЯ ИСТЕКЛО
+                hold_time = datetime.now() - entry_time
+                if hold_time > timedelta(hours=self.max_hold_hours):
+                    positions_to_sell.append(
+                        (symbol, position, current_price, "ВРЕМЯ ИСТЕКЛО")
+                    )
+                    continue
+
+        return positions_to_sell
+
+    def execute_buy_order(self, symbol, amount_usdt, price):
+        """Быстрое выполнение ордера на покупку"""
+        try:
+            available_balance = self.get_usdt_balance()
+            if available_balance < amount_usdt:
+                logger.debug(f"⏹️ Недостаточно средств для покупки {symbol}")
+                return False
+
+            quantity = amount_usdt / price
+            quantity = Decimal(
+                str(self.exchange.amount_to_precision(symbol, float(quantity)))
+            )
+
+            logger.info(
+                f"🟢 ПОКУПКА: {symbol} | Сумма: {amount_usdt} USDT | Цена: {price} | Количество: {quantity}"
+            )
+
+            try:
+                market = self.exchange.market(symbol)
+                min_amount = market["limits"]["amount"]["min"]
+                if float(quantity) < min_amount:
+                    logger.debug(
+                        f"⏹️ Количество {quantity} меньше минимального {min_amount} для {symbol}"
+                    )
+                    return False
+            except:
+                return False
+
+            order = self.exchange.create_order(
+                symbol=symbol,
+                type="market",
+                side="buy",
+                amount=float(quantity),
+                params={"category": "spot"},
+            )
+
+            if self.db_conn:
+                with self.db_conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        INSERT INTO portfolio (symbol, quantity, entry_price, current_price)
+                        VALUES (%s, %s, %s, %s)
+                        """,
+                        (symbol, float(quantity), float(price), float(price)),
+                    )
+                    self.db_conn.commit()
+
+            logger.info(f"✅ Успешная покупка {symbol}")
+            return True
+
+        except Exception as e:
+            logger.error(f"❌ Ошибка покупки {symbol}: {e}")
+            return False
+
+    def execute_sell_order(self, symbol, quantity, price):
+        """Быстрое выполнение ордера на продажу"""
+        try:
+            quantity = Decimal(
+                str(self.exchange.amount_to_precision(symbol, float(quantity)))
+            )
+
+            logger.info(
+                f"🔴 ПРОДАЖА: {symbol} | Количество: {quantity} | Цена: {price}"
+            )
+
+            order = self.exchange.create_order(
+                symbol=symbol,
+                type="market",
+                side="sell",
+                amount=float(quantity),
+                params={"category": "spot"},
+            )
+
+            if self.db_conn:
+                with self.db_conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        UPDATE portfolio SET status = 'closed'
+                        WHERE symbol = %s AND status = 'active'
+                        """,
+                        (symbol,),
+                    )
+                    self.db_conn.commit()
+
+            proceeds = Decimal(str(quantity)) * price
+            logger.info(f"✅ Успешная продажа {symbol} | Выручка: {proceeds:.2f} USDT")
+            return proceeds
+
+        except Exception as e:
+            logger.error(f"❌ Ошибка продажи {symbol}: {e}")
+            return Decimal("0")
+
+    def log_enhanced_portfolio_status(self, portfolio, tickers):
+        """Улучшенное логирование статуса портфеля"""
+        try:
+            total_value = Decimal("0")
+            total_pnl = Decimal("0")
+            category_value = {}
+
+            logger.info("📊 РАСШИРЕННЫЙ СТАТУС ПОРТФЕЛЯ:")
+
+            for symbol, position in portfolio.items():
+                if symbol in tickers:
+                    current_price = tickers[symbol]["price"]
+                    category = tickers[symbol].get("category", "unknown")
+                else:
+                    current_price = position.get("current_price", Decimal("0"))
+                    category = "unknown"
+
+                quantity = position["quantity"]
+                entry_price = position["entry_price"]
+
+                current_value = quantity * current_price
+                total_value += current_value
+
+                # Накопление по категориям
+                category_value[category] = (
+                    category_value.get(category, Decimal("0")) + current_value
+                )
+
+                pnl = (current_price - entry_price) * quantity
+                total_pnl += pnl
+                pnl_percent = (
+                    ((current_price / entry_price) - Decimal("1")) * Decimal("100")
+                    if entry_price > Decimal("0")
+                    else Decimal("0")
+                )
+
+                logger.info(f"   {symbol} [{category}]:")
+                logger.info(f"     PnL: {pnl:.2f} USDT ({pnl_percent:.2f}%)")
+                logger.info(f"     Стоимость: {current_value:.2f} USDT")
+
+            balance = self.get_usdt_balance()
+            total_assets = total_value + balance
+
+            logger.info(f"💰 РАСПРЕДЕЛЕНИЕ ПО КАТЕГОРИЯМ:")
+            for category, value in category_value.items():
+                percent = (
+                    (value / total_value * Decimal("100"))
+                    if total_value > Decimal("0")
+                    else Decimal("0")
+                )
+                logger.info(f"   {category}: {value:.2f} USDT ({percent:.1f}%)")
+
+            logger.info(f"📈 ИТОГО:")
+            logger.info(f"     Общие активы: {total_assets:.2f} USDT")
+            logger.info(f"     Общий PnL: {total_pnl:.2f} USDT")
+
+        except Exception as e:
+            logger.error(f"❌ Ошибка расширенного логирования: {e}")
+
+    def enhanced_rebalance(self, iteration):
+        """УЛУЧШЕННАЯ ребалансировка с диверсификацией"""
+        try:
+            if iteration == 1 or iteration % 10 == 0:
+                logger.info(f"🔄 УЛУЧШЕННАЯ ребалансировка (итерация #{iteration})")
+
+            # РАСШИРЕННЫЙ МОНИТОРИНГ
+            tickers = self.get_cached_tickers()
+            available_balance = self.get_usdt_balance()
+            current_portfolio = self.get_current_portfolio()
+
+            # АНАЛИЗ ТОП-ВОЗМОЖНОСТЕЙ
+            if tickers:
+                top_opportunities = sorted(
+                    tickers.items(), key=lambda x: x[1]["score"], reverse=True
+                )[:10]
+                logger.info("🏆 ТОП-10 возможностей:")
+                for i, (symbol, data) in enumerate(top_opportunities[:5], 1):
+                    logger.info(
+                        f"   {i}. {symbol}: скор={data['score']:.2f}, цена={data['price']}, кат={data['category']}"
+                    )
+
+            current_time = time.time()
+            if current_time - self.last_status_log >= self.status_log_interval:
+                self.log_enhanced_portfolio_status(current_portfolio, tickers)
+                self.last_status_log = current_time
+
+            # СИНХРОНИЗАЦИЯ
+            if len(current_portfolio) == 0:
+                logger.info("📥 Портфель пуст, синхронизируем с биржей...")
+                self.sync_portfolio_with_exchange()
+                current_portfolio = self.get_current_portfolio()
+
+            # ОБНОВЛЕНИЕ ЦЕН
+            self.update_portfolio_prices(tickers)
+
+            # ПРИОРИТЕТ 1: ПРОДАЖА
+            positions_to_sell = self.check_stop_conditions(current_portfolio, tickers)
+
+            if positions_to_sell:
+                logger.info("🚨 АКТИВНЫЕ СТОП-УСЛОВИЯ:")
+                for symbol, position, current_price, reason in positions_to_sell:
+                    logger.info(f"   {symbol}: {reason} | Цена: {current_price}")
+                    sold_amount = self.execute_sell_order(
+                        symbol, position["quantity"], current_price
+                    )
+                    if sold_amount > 0:
+                        logger.info(f"   💰 Выручено: {sold_amount:.2f} USDT")
+                        if symbol in current_portfolio:
+                            del current_portfolio[symbol]
+
+            # ПРИОРИТЕТ 2: УЛУЧШЕННАЯ ПОКУПКА С ДИВЕРСИФИКАЦИЕЙ
+            if (
+                len(current_portfolio) < self.max_positions
+                and available_balance >= self.min_order + self.reserve_cash
+            ):
+                buy_power = available_balance - self.reserve_cash
+
+                # АНАЛИЗ ТЕКУЩЕЙ ДИВЕРСИФИКАЦИИ
+                current_categories = self.analyze_portfolio_diversification(
+                    current_portfolio, tickers
+                )
+
+                # ПОИСК ЛУЧШИХ ВОЗМОЖНОСТЕЙ С УЧЕТОМ ДИВЕРСИФИКАЦИИ
+                best_opportunities = self.find_diversified_opportunities(
+                    tickers, current_portfolio, current_categories
+                )
+
+                bought_count = 0
+                for symbol, score, price, category in best_opportunities:
+                    if (
+                        buy_power >= self.min_order
+                        and bought_count < 2
+                        and score > Decimal("1")
+                    ):
+                        amount_to_spend = min(self.position_size, buy_power)
+
+                        if self.execute_buy_order(symbol, amount_to_spend, price):
+                            bought_count += 1
+                            buy_power -= amount_to_spend
+                            available_balance = self.get_usdt_balance()
+                            buy_power = available_balance - self.reserve_cash
+
+                if bought_count == 0 and best_opportunities:
+                    logger.info(
+                        "ℹ️ Не куплено позиций после диверсифицированного отбора"
+                    )
+
+            return True
+
+        except Exception as e:
+            logger.error(f"❌ Ошибка улучшенной ребалансировки: {e}")
+            return False
+
+    def run_optimized(self):
+        """Оптимизированный основной цикл с улучшенным логированием"""
+        logger.info("🚀 Запуск ОПТИМИЗИРОВАННОГО спот-бота Bybit")
+        logger.info(f"💼 Капитал: {self.total_capital} USDT")
+        logger.info(f"🎯 Цели: TP={self.take_profit} | SL={self.stop_loss}")
+        logger.info(f"⏱️  Интервал: 15 секунд")
+        logger.info(f"📊 Статус портфеля будет обновляться каждую минуту")
+
+        iteration = 0
+        error_count = 0
+        max_errors = 5
+
+        while True:
+            try:
+                iteration += 1
+
+                if not self.db_conn or self.db_conn.closed:
+                    self.db_conn = self.init_db()
+
+                success = self.enhanced_rebalance(iteration)
+
+                if success:
+                    error_count = 0
+                    if iteration % 40 == 0:
+                        logger.info(f"📈 Прогресс: итерация #{iteration}")
+                else:
+                    error_count += 1
+                    if error_count >= max_errors:
+                        logger.error(
+                            "🚨 Превышено максимальное количество ошибок, пауза 60 секунд"
+                        )
+                        time.sleep(60)
+                        error_count = 0
+
+                time.sleep(15)
+
+            except KeyboardInterrupt:
+                logger.info("\n⏹️ Остановка бота по запросу пользователя...")
+                break
+            except Exception as e:
+                logger.error(f"❌ Критическая ошибка в основном цикле: {e}")
+                error_count += 1
+                time.sleep(30)
+
+
+if __name__ == "__main__":
+    required_env_vars = ["BYBIT_API_KEY", "BYBIT_API_SECRET"]
+    missing_vars = [var for var in required_env_vars if not os.getenv(var)]
+
+    if missing_vars:
+        print(
+            f"❌ Отсутствуют обязательные переменные окружения: {', '.join(missing_vars)}"
+        )
+        exit(1)
+
+    bot = BybitSpotBot()
+
+    try:
+        bot.run_optimized()
+    except KeyboardInterrupt:
+        logger.info("\n⏹️ Остановка бота...")
+    finally:
+        if bot.db_conn:
+            bot.db_conn.close()
