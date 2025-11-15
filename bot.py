@@ -1204,10 +1204,13 @@ class BybitSpotBot:
             return False
 
     def execute_sell_order(self, symbol, quantity, price):
-        """Продажа с проверкой реального баланса и синхронизацией"""
+        """Продажа с таймаутом и улучшенной обработкой ошибок"""
+        max_wait_time = 30  # секунд максимум ожидания
+        start_time = time.time()  # 🔴 ДОБАВЛЕНО: определение start_time
+
         try:
             logger.info(f"💰 ДЕТАЛИ ПРОДАЖИ {symbol}:")
-            logger.info(f"   Количество из базы: {quantity}")
+            logger.info(f"   Количество: {quantity}")
             logger.info(f"   Ожидаемая цена: {price}")
 
             # ПРОВЕРКА ФОРМАТА
@@ -1215,67 +1218,13 @@ class BybitSpotBot:
                 symbol = symbol.replace(":", "/")
                 logger.info(f"   Исправленный символ: {symbol}")
 
-            # 🔴 ВАЖНО: Сначала синхронизируем портфель
-            logger.info("🔄 Проверка реального баланса перед продажей...")
-            self.sync_portfolio_with_exchange()
-
-            # Получаем актуальный портфель
             portfolio = self.get_current_portfolio()
             if symbol not in portfolio:
-                logger.error(f"❌ ПОЗИЦИЯ НЕ НАЙДЕНА В ПОРТФЕЛЕ: {symbol}")
+                logger.error(f"❌ ПОЗИЦИЯ НЕ НАЙДЕНА: {symbol}")
                 return Decimal("0")
 
-            # 🔴 ПРОВЕРЯЕМ РЕАЛЬНЫЙ БАЛАНС НА БИРЖЕ
-            bybit_symbol = symbol.replace("/", "")
-            base_currency = bybit_symbol.replace("USDT", "")
-
-            try:
-                balance = self.exchange.fetch_balance(params={"type": "spot"})
-                real_balance = Decimal("0")
-
-                # Ищем реальный баланс монеты
-                if base_currency in balance and isinstance(
-                    balance[base_currency], dict
-                ):
-                    real_balance = Decimal(str(balance[base_currency].get("free", 0)))
-                elif "free" in balance and base_currency in balance["free"]:
-                    real_balance = Decimal(str(balance["free"][base_currency]))
-
-                logger.info(f"🔍 РЕАЛЬНЫЙ БАЛАНС {base_currency}: {real_balance}")
-                logger.info(f"🔍 БАЛАНС ИЗ БАЗЫ: {quantity}")
-
-                # Если реальный баланс меньше, используем реальный
-                if real_balance < quantity:
-                    logger.warning(
-                        f"⚠️ Реальный баланс меньше базы: {real_balance} < {quantity}"
-                    )
-                    if real_balance > Decimal("0"):
-                        quantity = real_balance
-                        logger.info(f"🔄 Используем реальный баланс: {quantity}")
-                    else:
-                        logger.error(f"❌ Нулевой реальный баланс для {symbol}")
-                        # Закрываем позицию в БД
-                        if self.db_conn:
-                            with self.db_conn.cursor() as cur:
-                                cur.execute(
-                                    """
-                                    UPDATE portfolio
-                                    SET status = 'closed', exit_time = NOW()
-                                    WHERE symbol = %s AND status = 'active'
-                                    """,
-                                    (symbol,),
-                                )
-                            self.db_conn.commit()
-                            logger.info(
-                                f"🔒 Позиция закрыта в БД: {symbol} (нулевой баланс)"
-                            )
-                        return Decimal("0")
-
-            except Exception as e:
-                logger.error(f"❌ Ошибка проверки реального баланса: {e}")
-                # Продолжаем с количеством из базы, но логируем предупреждение
-
             # ФОРМАТ ДЛЯ BYBIT
+            bybit_symbol = symbol.replace("/", "")
             logger.info(f"   Bybit символ: {bybit_symbol}")
 
             # ПРОВЕРКА ПАРЫ
@@ -1294,53 +1243,9 @@ class BybitSpotBot:
                     )
                 )
                 logger.info(f"   Количество с точностью: {precision_quantity}")
-
-                # 🔴 ДОПОЛНИТЕЛЬНАЯ ПРОВЕРКА: если количество стало нулевым после точности
-                if precision_quantity <= Decimal("0"):
-                    logger.error(
-                        f"❌ Количество стало нулевым после точности: {precision_quantity}"
-                    )
-                    # Закрываем позицию в БД
-                    if self.db_conn:
-                        with self.db_conn.cursor() as cur:
-                            cur.execute(
-                                """
-                                UPDATE portfolio
-                                SET status = 'closed', exit_time = NOW()
-                                WHERE symbol = %s AND status = 'active'
-                                """,
-                                (symbol,),
-                            )
-                        self.db_conn.commit()
-                    return Decimal("0")
-
             except Exception as e:
                 logger.error(f"❌ Ошибка точности: {e}")
                 return Decimal("0")
-
-            # 🔴 ПРОВЕРКА МИНИМАЛЬНОГО КОЛИЧЕСТВА
-            try:
-                min_amount = market["limits"]["amount"]["min"]
-                if float(precision_quantity) < min_amount:
-                    logger.error(
-                        f"❌ Количество меньше минимального: {precision_quantity} < {min_amount}"
-                    )
-                    # Закрываем позицию в БД как пыль
-                    if self.db_conn:
-                        with self.db_conn.cursor() as cur:
-                            cur.execute(
-                                """
-                                UPDATE portfolio
-                                SET status = 'closed', exit_time = NOW()
-                                WHERE symbol = %s AND status = 'active'
-                                """,
-                                (symbol,),
-                            )
-                        self.db_conn.commit()
-                        logger.info(f"💨 Позиция закрыта как пыль: {symbol}")
-                    return Decimal("0")
-            except Exception as e:
-                logger.warning(f"⚠️ Не удалось проверить минимальное количество: {e}")
 
             # СОЗДАНИЕ ОРДЕРА
             logger.info(f"🎯 ВЫПОЛНЕНИЕ ПРОДАЖИ: {bybit_symbol}")
@@ -1367,8 +1272,10 @@ class BybitSpotBot:
                 proceeds = Decimal("0")
 
                 for attempt in range(1, max_retries + 1):
+                    # 🔴 ИСПРАВЛЕНИЕ: Проверка таймаута
                     if time.time() - start_time > max_wait_time:
                         logger.error("⏰ ТАЙМАУТ подтверждения ордера")
+                        # Пытаемся отменить ордер
                         try:
                             self.exchange.cancel_order(order_id, bybit_symbol)
                             logger.info("🛑 Ордер отменен по таймауту")
@@ -1408,7 +1315,7 @@ class BybitSpotBot:
 
                     # 2. ПОИСК В ЗАКРЫТЫХ ОРДЕРАХ
                     try:
-                        since = int((time.time() - 1800) * 1000)
+                        since = int((time.time() - 1800) * 1000)  # 30 минут
                         closed_orders = self.exchange.fetch_closed_orders(
                             bybit_symbol, since=since, limit=100
                         )
@@ -1432,10 +1339,12 @@ class BybitSpotBot:
                     except Exception as e:
                         logger.debug(f"📡 closed_orders: {e}")
 
+                # === ПРОВЕРКА РЕЗУЛЬТАТА ===
                 if not order_executed:
                     logger.error(
                         f"❌ ОРДЕР {order_id} НЕ ПОДТВЕРЖДЁН ПОСЛЕ {max_retries} ПОПЫТОК"
                     )
+                    logger.error("🚨 ПОЗИЦИЯ НЕ ЗАКРЫТА — ПРОВЕРЬТЕ ВРУЧНУЮ НА BYBIT")
                     return Decimal("0")
 
                 # === ЗАКРЫТИЕ В БД ===
@@ -1464,23 +1373,6 @@ class BybitSpotBot:
 
             except Exception as order_error:
                 logger.error(f"❌ ОШИБКА СОЗДАНИЯ ОРДЕРА: {order_error}")
-                # 🔴 ЕСЛИ ОШИБКА "Insufficient balance" - ЗАКРЫВАЕМ ПОЗИЦИЮ В БД
-                if "Insufficient balance" in str(order_error):
-                    logger.error(
-                        "🚨 Обнаружена рассинхронизация: позиция в БД, но нет на бирже"
-                    )
-                    if self.db_conn:
-                        with self.db_conn.cursor() as cur:
-                            cur.execute(
-                                """
-                                UPDATE portfolio
-                                SET status = 'closed', exit_time = NOW()
-                                WHERE symbol = %s AND status = 'active'
-                                """,
-                                (symbol,),
-                            )
-                        self.db_conn.commit()
-                        logger.info(f"🔒 Позиция принудительно закрыта в БД: {symbol}")
                 return Decimal("0")
 
         except Exception as e:
