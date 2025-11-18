@@ -1089,39 +1089,37 @@ class BybitSpotBot:
         return portfolio
 
     def sync_portfolio_with_exchange(self):
-        """Безопасная синхронизация портфеля с обработкой ошибок данных"""
+        """
+        Исправленная синхронизация: Принудительно закрывает пыль в БД.
+        """
         try:
             logger.info("🔄 ЗАПУСК СИНХРОНИЗАЦИИ ПОРТФЕЛЯ")
             balance = self.exchange.fetch_balance(params={"type": "spot"})
             added_count = 0
             updated_count = 0
+            closed_count = 0
 
-            # 🔴 ВСПОМОГАТЕЛЬНАЯ ФУНКЦИЯ ДЛЯ БЕЗОПАСНОГО ПРЕОБРАЗОВАНИЯ
+            # Вспомогательная функция
             def safe_decimal(value, default=Decimal("0")):
                 if value is None:
                     return default
                 try:
-                    str_value = str(value).strip().replace(",", ".")
-                    # Убираем все нечисловые символы кроме точек и минусов
-                    cleaned = "".join(c for c in str_value if c.isdigit() or c in ".-")
-                    if cleaned and cleaned != ".":
-                        return Decimal(cleaned)
-                    return default
+                    return Decimal(str(value))
                 except:
                     return default
 
-            # Читаем активные позиции из БД
+            # 1. Получаем список того, что Бот считает активным
             db_active = set()
-            if not self.db_conn:
-                logger.warning("⚠️ База данных не доступна, пропуск синхронизации")
-                return False
             if self.db_conn:
                 with self.db_conn.cursor() as cur:
                     cur.execute("SELECT symbol FROM portfolio WHERE status = 'active'")
                     db_active = {row[0] for row in cur.fetchall()}
 
-            logger.info(f"📊 Начальный портфель из БД: {len(db_active)} позиций")
+            # 2. Проходим по балансу биржи
+            # Нам нужно проверить ВСЕ активные монеты из БД, есть ли они на балансе
 
+            # Сначала соберем реальный баланс в словарь
+            real_balances = {}
             for currency, data in balance.items():
                 if currency in [
                     "free",
@@ -1133,79 +1131,72 @@ class BybitSpotBot:
                     "USDT",
                 ]:
                     continue
-
                 if isinstance(data, dict):
-                    free_balance = safe_decimal(data.get("free", 0))
-                    if free_balance <= Decimal("0.0001"):
-                        continue
+                    free = safe_decimal(data.get("free", 0))
+                    total = safe_decimal(data.get("total", 0))
+                    # Используем total, так как часть может быть в ордерах
+                    if total > Decimal("0"):
+                        real_balances[f"{currency}/USDT"] = total
 
-                    symbol = f"{currency}/USDT"
-                    bybit_symbol = symbol.replace("/", "")
+            # А. Обработка того, что есть на бирже
+            for symbol, qty in real_balances.items():
+                bybit_symbol = symbol.replace("/", "")
+                try:
+                    ticker = self.exchange.fetch_ticker(bybit_symbol)
+                    current_price = safe_decimal(ticker.get("last"))
+                except:
+                    current_price = Decimal("0")
 
-                    try:
-                        market = self.exchange.market(bybit_symbol)
-                    except Exception as e:
-                        logger.debug(f"⚠️ Пара не найдена: {bybit_symbol} - {e}")
-                        continue
+                val = qty * current_price
 
-                    try:
-                        ticker = self.exchange.fetch_ticker(bybit_symbol)
-                        current_price = safe_decimal(ticker.get("last"))
-                        if current_price <= Decimal("0"):
-                            continue
-                    except Exception as e:
-                        logger.debug(f"⚠️ Не удалось получить цену: {symbol} - {e}")
-                        continue
-
-                    position_value = free_balance * current_price
-                    if position_value < Decimal("1"):
-                        continue
-
-                    # ЛОГИКА СИНХРОНИЗАЦИИ
-                    if symbol in db_active:
-                        # ОБНОВЛЯЕМ СУЩЕСТВУЮЩУЮ ПОЗИЦИЮ
-                        with self.db_conn.cursor() as cur:
-                            cur.execute(
-                                """
-                                UPDATE portfolio
-                                SET quantity = %s, current_price = %s
-                                WHERE symbol = %s AND status = 'active'
-                                """,
-                                (float(free_balance), float(current_price), symbol),
-                            )
-                        logger.info(
-                            f"🔄 ОБНОВЛЕНА: {symbol} | {free_balance} @ {current_price}"
-                        )
-                        updated_count += 1
-                    else:
-                        # ДОБАВЛЯЕМ НОВУЮ ПОЗИЦИЮ
-                        with self.db_conn.cursor() as cur:
-                            cur.execute(
-                                """
-                                INSERT INTO portfolio
-                                (symbol, quantity, entry_price, current_price, status)
+                if val > Decimal("2"):
+                    # Это реальная позиция -> Обновляем или добавляем
+                    with self.db_conn.cursor() as cur:
+                        cur.execute(
+                            """
+                                INSERT INTO portfolio (symbol, quantity, entry_price, current_price, status)
                                 VALUES (%s, %s, %s, %s, 'active')
                                 ON CONFLICT (symbol) WHERE status = 'active'
-                                DO UPDATE SET
-                                    quantity = EXCLUDED.quantity,
-                                    entry_price = EXCLUDED.entry_price,
-                                    current_price = EXCLUDED.current_price
-                                """,
-                                (
-                                    symbol,
-                                    float(free_balance),
-                                    float(current_price),
-                                    float(current_price),
-                                ),
+                                DO UPDATE SET quantity = EXCLUDED.quantity, current_price = EXCLUDED.current_price
+                            """,
+                            (
+                                symbol,
+                                float(qty),
+                                float(current_price),
+                                float(current_price),
+                            ),
+                        )
+                    if symbol in db_active:
+                        updated_count += 1
+                    else:
+                        added_count += 1
+                else:
+                    # Это ПЫЛЬ (< $2), но она есть в БД как активная -> ЗАКРЫВАЕМ
+                    if symbol in db_active:
+                        with self.db_conn.cursor() as cur:
+                            cur.execute(
+                                "UPDATE portfolio SET status = 'closed' WHERE symbol = %s AND status = 'active'",
+                                (symbol,),
                             )
                         logger.info(
-                            f"✅ ДОБАВЛЕНА: {symbol} | {free_balance} @ {current_price}"
+                            f"🧹 Закрыта пыль при синхронизации: {symbol} (${val:.2f})"
                         )
-                        added_count += 1
+                        closed_count += 1
+
+            # Б. Обработка того, что есть в БД, но ИСЧЕЗЛО с биржи (полностью продано)
+            for symbol in db_active:
+                if symbol not in real_balances:
+                    with self.db_conn.cursor() as cur:
+                        cur.execute(
+                            "UPDATE portfolio SET status = 'closed' WHERE symbol = %s AND status = 'active'",
+                            (symbol,),
+                        )
+                    logger.info(f"👻 Позиция исчезла с баланса (закрываем): {symbol}")
+                    closed_count += 1
 
             self.db_conn.commit()
             logger.info(
-                f"📊 Синхронизация завершена. Добавлено: {added_count}, Обновлено: {updated_count}"
+                f"📊 Синхронизация: +{added_count} | ~{updated_count} | -{closed_count} (закрыто)"
             )
             return True
 
@@ -1297,9 +1288,11 @@ class BybitSpotBot:
         return positions_to_sell
 
     def enhanced_rebalance(self, iteration):
-        """Улучшенная ребалансировка с полным функционалом и детальным логированием"""
+        """
+        Исправленная ребалансировка: Корректное закрытие сделок в БД.
+        """
         try:
-            if iteration <= 3:  # Первые 3 итерации
+            if iteration <= 3:
                 logger.info("🔄 Принудительное обновление тикеров...")
                 self.cached_tickers = self.safe_fetch_filtered_tickers()
                 self.last_tickers_update = time.time()
@@ -1307,69 +1300,62 @@ class BybitSpotBot:
             if iteration == 1 or iteration % 10 == 0:
                 logger.info(f"🔄 Ребалансировка (итерация #{iteration})")
 
-            # 🔴 АВТОМАТИЧЕСКАЯ АДАПТАЦИЯ ПАРАМЕТРОВ ПОД РЕАЛЬНЫЙ КАПИТАЛ
             self.auto_adjust_parameters()
 
-            # СИНХРОНИЗАЦИЯ ДАННЫХ
+            # 1. Синхронизация (теперь она умеет убивать зомби-позиции)
             logger.info("🔄 Синхронизация портфеля...")
             self.sync_portfolio_with_exchange()
 
-            # ПОЛУЧЕНИЕ АКТУАЛЬНЫХ ДАННЫХ
             available_balance = self.get_usdt_balance()
             tickers = self.get_cached_tickers()
             current_portfolio = self.get_current_portfolio()
 
-            # 🔴 ДЕТАЛЬНОЕ ЛОГИРОВАНИЕ СТАТУСА
+            # ЛОГИРОВАНИЕ
             logger.info("📊 ТЕКУЩИЙ СТАТУС:")
             logger.info(f"   💰 Баланс: {available_balance:.2f} USDT")
             logger.info(f"   💸 Резерв: {self.reserve_cash} USDT")
-            logger.info(f"   📦 Позиций: {len(current_portfolio)}/{self.max_positions}")
+            # Считаем только реальные позиции для логирования
+            real_pos = [
+                k
+                for k, v in current_portfolio.items()
+                if (v["quantity"] * v["current_price"]) > Decimal("2")
+            ]
             logger.info(
-                f"   🎯 Размер позиции: {self.min_position_size}-{self.max_position_size} USDT"
-            )
-            logger.info(f"   📈 Доступно тикеров: {len(tickers)}")
-
-            # РАСЧЕТ РАЗМЕРА ПОЗИЦИИ ПО КЕЛЛИ
-            win_rate, avg_win, avg_loss = self.kelly_manager.get_trade_statistics()
-            kelly_position_size = self.kelly_manager.calculate_position_size(
-                win_rate, avg_win, avg_loss
-            )
-            kelly_position_size = max(
-                self.min_position_size, min(self.max_position_size, kelly_position_size)
+                f"   📦 Позиций: {len(real_pos)}/{self.max_positions} (Всего в БД: {len(current_portfolio)})"
             )
 
-            logger.info(f"🎯 СТАТИСТИКА ТОРГОВЛИ:")
-            logger.info(f"   Win Rate: {win_rate:.2%}")
-            logger.info(f"   Средняя прибыль: {avg_win:.2%}")
-            logger.info(f"   Средний убыток: {avg_loss:.2%}")
-            logger.info(f"   Размер позиции по Келли: {kelly_position_size:.2f} USDT")
-
-            # ПРОВЕРКА СТОП-УСЛОВИЙ ДЛЯ СУЩЕСТВУЮЩИХ ПОЗИЦИЙ
+            # --- ПРОДАЖА ---
             positions_to_sell = self.check_stop_conditions(current_portfolio, tickers)
 
             if positions_to_sell:
                 logger.info("🚨 АКТИВНЫЕ СТОП-УСЛОВИЯ:")
-                total_sold = Decimal("0")
 
                 for symbol, position, current_price, reason in positions_to_sell:
                     logger.info(f"   🔻 {symbol}: {reason} | Цена: {current_price:.6f}")
 
-                    # УМНОЕ ИСПОЛНЕНИЕ ПРОДАЖИ
+                    # Попытка продажи (вернет True, если продал ИЛИ если это пыль)
                     success = self.smart_order_manager.execute_smart_sell(
                         symbol, position["quantity"], current_price
                     )
 
                     if success:
-                        # РАСЧЕТ PnL
+                        # !!! ВАЖНЕЙШЕЕ ИСПРАВЛЕНИЕ !!!
+                        # Сразу закрываем позицию в БД, не дожидаясь синхронизации
+                        with self.db_conn.cursor() as cur:
+                            cur.execute(
+                                "UPDATE portfolio SET status = 'closed' WHERE symbol = %s",
+                                (symbol,),
+                            )
+                        self.db_conn.commit()
+
+                        # Статистика
                         pnl = (current_price - position["entry_price"]) * position[
                             "quantity"
                         ]
                         pnl_pct = (current_price / position["entry_price"]) - Decimal(
                             "1"
                         )
-                        total_sold += pnl
 
-                        # ОБНОВЛЕНИЕ ИСТОРИИ ТОРГОВЛИ
                         self.performance_analytics.add_trade(
                             {
                                 "symbol": symbol,
@@ -1379,209 +1365,105 @@ class BybitSpotBot:
                                 "exit_price": current_price,
                                 "pnl": pnl,
                                 "pnl_pct": pnl_pct,
-                                "commission": position["quantity"]
-                                * current_price
-                                * self.commission,
+                                "commission": 0,
                             }
                         )
-
-                        # ОБНОВЛЕНИЕ ДЛЯ КЕЛЛИ
                         self.kelly_manager.update_trade_history(
                             {"pnl": pnl, "pnl_pct": pnl_pct}
                         )
 
-                        logger.info(
-                            f"   ✅ Продано: {symbol} | PnL: {pnl:.4f} USDT ({pnl_pct:.2%})"
-                        )
+                        logger.info(f"   ✅ Продано (и закрыто в БД): {symbol}")
                     else:
                         logger.error(f"   ❌ Ошибка продажи: {symbol}")
 
-                if total_sold != Decimal("0"):
-                    logger.info(f"💰 ОБЩАЯ ВЫРУЧКА ОТ ПРОДАЖ: {total_sold:.4f} USDT")
-
-            # 🔴 ОБНОВЛЕНИЕ ДАННЫХ ПОСЛЕ ПРОДАЖ
-            if positions_to_sell:
-                available_balance = self.get_usdt_balance()
+                # Обновляем данные после продаж
                 current_portfolio = self.get_current_portfolio()
-                logger.info(f"🔄 ОБНОВЛЕННЫЙ БАЛАНС: {available_balance:.2f} USDT")
-                logger.info(
-                    f"🔄 ОБНОВЛЕННЫЙ ПОРТФЕЛЬ: {len(current_portfolio)} позиций"
-                )
+                available_balance = self.get_usdt_balance()
 
-            # 🔴 ПРОВЕРКА УСЛОВИЙ ДЛЯ ПОКУПКИ
-            available_for_trading = available_balance - self.reserve_cash
-            can_trade = available_for_trading >= kelly_position_size
-            # --- ИСПРАВЛЕНИЕ: Считаем только реальные позиции (>$2) ---
+            # --- ПОКУПКА ---
+            # Пересчитываем свободные слоты на основе РЕАЛЬНЫХ позиций (> $2)
             real_positions_count = 0
             for sym, pos in current_portfolio.items():
-                value = pos["quantity"] * pos["current_price"]
-                if value > Decimal("1"):  # Игнорируем пыль меньше 2$
+                if (pos["quantity"] * pos["current_price"]) > Decimal("2"):
                     real_positions_count += 1
 
+            # Принудительно обнуляем счетчик, если бот застрял в режиме снайпера, но позиций нет
+            if real_positions_count == 0 and len(current_portfolio) > 0:
+                logger.info(
+                    "🧹 Обнаружены фантомные позиции, игнорируем их для покупки."
+                )
+                real_positions_count = 0
+
             has_free_slots = real_positions_count < self.max_positions
-            logger.info(
-                f"   📦 Реальных позиций (>$2): {real_positions_count}/{self.max_positions}"
-            )
-            # ---------------------------------------------------------
+            available_for_trading = available_balance - self.reserve_cash
 
-            logger.info("🔍 ПРОВЕРКА УСЛОВИЙ ДЛЯ ПОКУПКИ:")
-            logger.info(
-                f"   💪 Доступно для торговли: {available_for_trading:.2f} USDT"
-            )
-            logger.info(f"   ✅ Может торговать: {can_trade}")
-            logger.info(f"   📦 Свободные слоты: {has_free_slots}")
+            # Размер позиции (защита от None)
+            target_size = self.min_position_size
+            if target_size is None:
+                target_size = Decimal("10")
 
-            # 🔴 ПОИСК И ИСПОЛНЕНИЕ ПОКУПОК
+            can_trade = available_for_trading >= target_size
+
             if can_trade and has_free_slots:
                 logger.info("🎯 ПОИСК ТОРГОВЫХ ВОЗМОЖНОСТЕЙ...")
-
-                # ПОИСК ЛУЧШИХ ВОЗМОЖНОСТЕЙ
                 best_opportunities = self.find_optimized_opportunities(
                     tickers, current_portfolio
                 )
 
-                if best_opportunities:
-                    logger.info("🏆 ТОП-5 ВОЗМОЖНОСТЕЙ:")
-                    for i, (symbol, score, price, category) in enumerate(
-                        best_opportunities[:5], 1
-                    ):
-                        logger.info(
-                            f"   {i}. {symbol}: Score {score:.2f} | Цена {price:.6f} | Категория {category}"
-                        )
-                else:
-                    logger.info("   ℹ️ Подходящих возможностей не найдено")
-
+                # Лимит покупок за цикл
                 bought_count = 0
-                max_buys_per_cycle = min(2, self.max_positions - len(current_portfolio))
 
                 for symbol, score, price, category in best_opportunities:
-                    if bought_count >= max_buys_per_cycle:
-                        break
+                    if bought_count >= 1:
+                        break  # Покупаем по 1 за раз для безопасности
 
-                    # 🔴 ПРОВЕРКА МИНИМАЛЬНОГО SCORE
-                    if score < Decimal("6"):  # Минимальный порог качества
-                        logger.debug(
-                            f"   ⏩ Пропущено {symbol}: низкий score ({score:.2f})"
-                        )
+                    if score < Decimal("6"):
                         continue
 
-                    # 🔴 РАСЧЕТ ATR И ДИНАМИЧЕСКИХ СТОПОВ
-                    atr = self.calculate_atr(symbol)
-                    dynamic_stops = self.calculate_dynamic_stops(symbol, price, atr)
-
-                    logger.info(f"🎯 АНАЛИЗ {symbol}:")
-                    logger.info(f"   Score: {score:.2f}")
-                    logger.info(f"   ATR: {atr:.4f} ({atr * 100:.2f}%)")
-                    logger.info(f"   Стоп-лосс: {dynamic_stops['stop_loss']:.6f}")
-                    logger.info(f"   Тейк-профит: {dynamic_stops['take_profit']:.6f}")
-
-                    # 🔴 ПРОВЕРКА ДОСТУПНЫХ СРЕДСТВ
-                    if available_for_trading < kelly_position_size:
-                        logger.warning(f"   ⚠️ Недостаточно средств для {symbol}")
+                    # Проверка денег (еще раз)
+                    if available_for_trading < target_size:
                         break
 
-                    logger.info(
-                        f"🛒 ПОПЫТКА ПОКУПКИ {symbol} на {kelly_position_size:.2f} USDT"
-                    )
+                    # Определяем размер позиции (Sniper mode = all in, иначе стандарт)
+                    buy_amount = target_size
+                    if self.max_positions == 1:
+                        buy_amount = available_for_trading  # На все деньги
 
-                    # 🔴 УМНОЕ ИСПОЛНЕНИЕ ПОКУПКИ
+                    logger.info(f"🛒 ПОПЫТКА ПОКУПКИ {symbol} на {buy_amount:.2f} USDT")
+
                     success = self.smart_order_manager.execute_smart_buy(
-                        symbol, kelly_position_size
+                        symbol, buy_amount
                     )
 
                     if success:
                         bought_count += 1
-
-                        # 🔴 ОБНОВЛЕНИЕ ДАННЫХ ПОСЛЕ УСПЕШНОЙ ПОКУПКИ
-                        available_balance = self.get_usdt_balance()
-                        current_portfolio = self.get_current_portfolio()
-                        available_for_trading = available_balance - self.reserve_cash
-
-                        # 🔴 ДОБАВЛЕНИЕ В ИСТОРИЮ ТОРГОВЛИ
-                        self.performance_analytics.add_trade(
-                            {
-                                "symbol": symbol,
-                                "side": "buy",
-                                "quantity": kelly_position_size
-                                / price,  # Примерное количество
-                                "entry_price": price,
-                                "pnl": Decimal("0"),
-                                "pnl_pct": Decimal("0"),
-                                "commission": kelly_position_size * self.commission,
-                            }
-                        )
-
+                        available_for_trading -= buy_amount
+                        # Запись в БД сделает следующая синхронизация или можно добавить тут
                         logger.info(f"✅ УСПЕШНАЯ ПОКУПКА: {symbol}")
-                        logger.info(
-                            f"🔄 ОСТАТОК ДЛЯ ПОКУПОК: {available_for_trading:.2f} USDT"
-                        )
-                        logger.info(
-                            f"📊 ОБНОВЛЕННЫЙ ПОРТФЕЛЬ: {len(current_portfolio)} позиций"
-                        )
-
-                        # 🔴 ОБНОВЛЕНИЕ КЭША ATR ДЛЯ НОВОЙ ПОЗИЦИИ
-                        if symbol in self.atr_cache:
-                            del self.atr_cache[symbol]
                     else:
                         logger.error(f"❌ ОШИБКА ПОКУПКИ: {symbol}")
-
-                if bought_count > 0:
-                    logger.info(f"✅ УСПЕШНО КУПЛЕНО ПОЗИЦИЙ: {bought_count}")
-                else:
-                    logger.info("ℹ️ Не куплено ни одной позиции в этом цикле")
-
             else:
-                # 🔴 ЛОГИРОВАНИЕ ПРИЧИН ОТСУТСТВИЯ ТОРГОВЛИ
                 if not can_trade:
                     logger.info(
-                        f"💤 Недостаточно средств. Доступно: {available_for_trading:.2f}, Требуется: {kelly_position_size:.2f}"
+                        f"💤 Ждем средств ({available_for_trading:.2f} < {target_size:.2f})"
                     )
                 if not has_free_slots:
                     logger.info(
-                        f"📦 Достигнут лимит позиций: {len(current_portfolio)}/{self.max_positions}"
+                        f"📦 Нет слотов ({real_positions_count}/{self.max_positions})"
                     )
 
-            # 🔴 ОБНОВЛЕНИЕ СТАТУСА ПОРТФЕЛЯ
-            current_time = time.time()
-            if current_time - self.last_status_log >= self.status_log_interval:
-                self.log_enhanced_portfolio_status(current_portfolio, tickers)
-                self.last_status_log = current_time
-
-            # 🔴 ГЕНЕРАЦИЯ ОТЧЕТА О ПРОИЗВОДИТЕЛЬНОСТИ
-            if iteration % 288 == 0:  # Каждые 24 часа (при 5-минутном интервале)
-                logger.info("📊 ГЕНЕРАЦИЯ ЕЖЕДНЕВНОГО ОТЧЕТА...")
+            # Отчеты и очистка
+            if iteration % 288 == 0:
                 self.performance_analytics.generate_performance_report()
-
-                # ДОПОЛНИТЕЛЬНАЯ СТАТИСТИКА
-                total_trades = len(self.performance_analytics.trade_history)
-                if total_trades > 0:
-                    winning_trades = len(
-                        [
-                            t
-                            for t in self.performance_analytics.trade_history
-                            if t["pnl"] > 0
-                        ]
-                    )
-                    win_rate = (winning_trades / total_trades) * 100
-                    total_pnl = sum(
-                        t["pnl"] for t in self.performance_analytics.trade_history
-                    )
-                    logger.info(f"📈 СТАТИСТИКА ЗА ВСЕ ВРЕМЯ:")
-                    logger.info(f"   Всего сделок: {total_trades}")
-                    logger.info(f"   Винрейт: {win_rate:.1f}%")
-                    logger.info(f"   Общий PnL: {total_pnl:.4f} USDT")
-
-            # 🔴 ОЧИСТКА УСТАРЕВШИХ ДАННЫХ
             self.cleanup_old_cache()
 
-            logger.info(f"✅ РЕБАЛАНСИРОВКА #{iteration} ЗАВЕРШЕНА УСПЕШНО")
             return True
 
         except Exception as e:
             logger.error(f"❌ ОШИБКА РЕБАЛАНСИРОВКИ: {e}")
             import traceback
 
-            logger.error(f"🔍 ДЕТАЛИ ОШИБКИ: {traceback.format_exc()}")
+            logger.error(traceback.format_exc())
             return False
 
     def calculate_momentum_score(self, ticker_data):
