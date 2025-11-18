@@ -143,25 +143,44 @@ class SmartOrderManager:
         self, symbol, quantity, current_price=None, max_slippage=Decimal("0.005")
     ):
         """
-        Быстрая продажа. Ставит цену чуть ниже рынка для мгновенного выхода.
+        Умная продажа: Проверяет реальный баланс перед продажей, чтобы избежать ошибки 'Insufficient balance'.
         """
         try:
-            # 1. Получаем стакан
+            # 1. Получаем реальный доступный баланс монеты с биржи
+            base_currency = symbol.split("/")[0]
+            balance = self.exchange.fetch_balance()
+
+            # Ищем баланс (учитываем возможные структуры ответа)
+            available = 0
+            if "free" in balance and base_currency in balance["free"]:
+                available = float(balance["free"][base_currency])
+
+            if available <= 0:
+                logger.warning(
+                    f"⚠️ Попытка продажи {symbol}, но баланс {base_currency} = 0"
+                )
+                return False
+
+            # Используем реальный баланс, если он меньше или чуть больше запрошенного (чтобы продать хвосты)
+            # Если разница небольшая (<10%), продаем всё, чтобы не оставлять пыль.
+            sell_quantity = available
+
+            # 2. Получаем стакан
             orderbook = self.exchange.fetch_order_book(symbol, limit=5)
             best_bid = float(orderbook["bids"][0][0])
 
-            # 2. Цена продажи: на 0.5% ниже лучшего бида (чтобы забрали сразу)
+            # 3. Цена продажи (чуть ниже рынка для скорости)
             sell_price = best_bid * 0.995
 
-            # 3. Округление
+            # 4. Округление
             price_final = self.exchange.price_to_precision(symbol, sell_price)
-            amount_final = self.exchange.amount_to_precision(symbol, float(quantity))
+            amount_final = self.exchange.amount_to_precision(symbol, sell_quantity)
 
             logger.info(
-                f"🔻 Попытка продажи {symbol}: {amount_final} шт. по цене до {price_final}"
+                f"🔻 Продажа {symbol}: {amount_final} (доступно: {available}) по {price_final}"
             )
 
-            # 4. Создаем ордер
+            # 5. Создаем ордер
             order = self.exchange.create_order(
                 symbol=symbol,
                 type="limit",
@@ -170,7 +189,7 @@ class SmartOrderManager:
                 price=price_final,
             )
 
-            return self.monitor_order_execution(order["id"], symbol, timeout=5)
+            return self.monitor_order_execution(order["id"], symbol, timeout=10)
 
         except Exception as e:
             logger.error(f"❌ Ошибка Smart Sell для {symbol}: {e}")
@@ -1318,7 +1337,18 @@ class BybitSpotBot:
             # 🔴 ПРОВЕРКА УСЛОВИЙ ДЛЯ ПОКУПКИ
             available_for_trading = available_balance - self.reserve_cash
             can_trade = available_for_trading >= kelly_position_size
-            has_free_slots = len(current_portfolio) < self.max_positions
+            # --- ИСПРАВЛЕНИЕ: Считаем только реальные позиции (>$2) ---
+            real_positions_count = 0
+            for sym, pos in current_portfolio.items():
+                value = pos["quantity"] * pos["current_price"]
+                if value > Decimal("1"):  # Игнорируем пыль меньше 2$
+                    real_positions_count += 1
+
+            has_free_slots = real_positions_count < self.max_positions
+            logger.info(
+                f"   📦 Реальных позиций (>$2): {real_positions_count}/{self.max_positions}"
+            )
+            # ---------------------------------------------------------
 
             logger.info("🔍 ПРОВЕРКА УСЛОВИЙ ДЛЯ ПОКУПКИ:")
             logger.info(
