@@ -594,6 +594,34 @@ class BybitSpotBot:
             logger.error(f"❌ Ошибка подключения к БД: {e}")
             return None
 
+    def calculate_rsi(self, symbol, period=14):
+        """
+        Расчет RSI для фильтрации перекупленных активов.
+        Таймфрейм 15m для краткосрочных входов.
+        """
+        try:
+            # Берем 100 свечей, чтобы хватило для сглаживания
+            ohlcv = self.exchange.fetch_ohlcv(symbol, "15m", limit=100)
+            if len(ohlcv) < period + 1:
+                return Decimal("50")  # Нейтральное значение при ошибке
+
+            closes = [float(x[4]) for x in ohlcv]
+            df = pd.Series(closes)
+            delta = df.diff()
+
+            # Разделяем на положительные и отрицательные изменения
+            gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
+            loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
+
+            # Избегаем деления на ноль
+            rs = gain / loss.replace(0, 0.0000001)
+            rsi = 100 - (100 / (1 + rs))
+
+            return Decimal(str(rsi.iloc[-1]))
+        except Exception as e:
+            logger.warning(f"⚠️ Ошибка расчета RSI для {symbol}: {e}")
+            return Decimal("50")
+
     def calculate_atr(self, symbol, period=14):
         """Расчет Average True Range"""
         try:
@@ -726,12 +754,13 @@ class BybitSpotBot:
     def calculate_market_structure_score(self, ticker_data):
         """
         Оценка структуры рынка + EMA Trend Filter.
+        ИСПРАВЛЕНО: Увеличен лимит свечей для корректного расчета EMA.
         """
         try:
             symbol = ticker_data["symbol"]
-            # Берем больше свечей для расчета EMA
-            ohlcv = self.exchange.fetch_ohlcv(symbol, "4h", limit=60)
-            if len(ohlcv) < 50:
+            # ВАЖНО: EMA требует "разгона", берем 200 свечей вместо 60
+            ohlcv = self.exchange.fetch_ohlcv(symbol, "4h", limit=200)
+            if len(ohlcv) < 150:
                 return Decimal("5")  # Недостаточно данных
 
             closes = [float(x[4]) for x in ohlcv]
@@ -740,17 +769,21 @@ class BybitSpotBot:
             current_price = Decimal(str(ohlcv[-1][4]))
 
             # --- EMA 50 FILTER ---
-            # Простой расчет EMA
             df_closes = pd.Series(closes)
-            ema_50 = Decimal(str(df_closes.ewm(span=50, adjust=False).mean().iloc[-1]))
+            # Используем min_periods, чтобы не получать NaN в начале
+            ema_50_val = (
+                df_closes.ewm(span=50, adjust=False, min_periods=50).mean().iloc[-1]
+            )
+            ema_50 = Decimal(str(ema_50_val))
 
             trend_score = Decimal("0")
             if current_price > ema_50:
                 trend_score = Decimal("3")  # Бонус за восходящий тренд
             else:
-                trend_score = Decimal("-2")  # Штраф за нисходящий тренд (цена под EMA)
+                trend_score = Decimal("-2")  # Штраф за нисходящий тренд
 
             # --- Price Position Logic ---
+            # Смотрим, где цена относительно последних 20 свечей
             recent_high = max(highs[-20:])
             recent_low = min(lows[-20:])
 
@@ -762,15 +795,13 @@ class BybitSpotBot:
                 )
 
                 if Decimal("0.3") <= price_position <= Decimal("0.8"):
-                    structure_score = Decimal(
-                        "7"
-                    )  # Оптимально: не на дне и не на самом пике
+                    structure_score = Decimal("7")  # Оптимально
                 elif price_position < Decimal("0.3"):
-                    structure_score = Decimal("5")  # Возможно дно, но опасно
+                    structure_score = Decimal("5")  # Дешево, но может падать дальше
                 else:
-                    structure_score = Decimal("3")  # Слишком дорого
+                    structure_score = Decimal("3")  # Дороговато
 
-            # Итоговый балл (структура + тренд) ограничим от 0 до 10
+            # Итоговый балл (0-10)
             total_score = structure_score + trend_score
             return max(Decimal("0"), min(Decimal("10"), total_score))
 
@@ -1289,7 +1320,7 @@ class BybitSpotBot:
 
     def enhanced_rebalance(self, iteration):
         """
-        Исправленная ребалансировка: Корректное закрытие сделок в БД.
+        Исправленная ребалансировка: RSI фильтр + Ускорение + Фикс БД.
         """
         try:
             if iteration <= 3:
@@ -1300,9 +1331,10 @@ class BybitSpotBot:
             if iteration == 1 or iteration % 10 == 0:
                 logger.info(f"🔄 Ребалансировка (итерация #{iteration})")
 
+            # 1. Адаптация параметров (тут сработает режим <$20)
             self.auto_adjust_parameters()
 
-            # 1. Синхронизация (теперь она умеет убивать зомби-позиции)
+            # 2. Синхронизация (чистит пыль)
             logger.info("🔄 Синхронизация портфеля...")
             self.sync_portfolio_with_exchange()
 
@@ -1310,37 +1342,31 @@ class BybitSpotBot:
             tickers = self.get_cached_tickers()
             current_portfolio = self.get_current_portfolio()
 
-            # ЛОГИРОВАНИЕ
-            logger.info("📊 ТЕКУЩИЙ СТАТУС:")
-            logger.info(f"   💰 Баланс: {available_balance:.2f} USDT")
-            logger.info(f"   💸 Резерв: {self.reserve_cash} USDT")
-            # Считаем только реальные позиции для логирования
+            # 3. Логирование статуса (только реальные позиции)
             real_pos = [
                 k
                 for k, v in current_portfolio.items()
                 if (v["quantity"] * v["current_price"]) > Decimal("2")
             ]
-            logger.info(
-                f"   📦 Позиций: {len(real_pos)}/{self.max_positions} (Всего в БД: {len(current_portfolio)})"
-            )
 
-            # --- ПРОДАЖА ---
+            logger.info("📊 ТЕКУЩИЙ СТАТУС:")
+            logger.info(f"   💰 Баланс: {available_balance:.2f} USDT")
+            logger.info(f"   📦 Позиций: {len(real_pos)}/{self.max_positions}")
+
+            # --- БЛОК ПРОДАЖИ ---
             positions_to_sell = self.check_stop_conditions(current_portfolio, tickers)
 
             if positions_to_sell:
                 logger.info("🚨 АКТИВНЫЕ СТОП-УСЛОВИЯ:")
-
                 for symbol, position, current_price, reason in positions_to_sell:
                     logger.info(f"   🔻 {symbol}: {reason} | Цена: {current_price:.6f}")
 
-                    # Попытка продажи (вернет True, если продал ИЛИ если это пыль)
                     success = self.smart_order_manager.execute_smart_sell(
                         symbol, position["quantity"], current_price
                     )
 
                     if success:
-                        # !!! ВАЖНЕЙШЕЕ ИСПРАВЛЕНИЕ !!!
-                        # Сразу закрываем позицию в БД, не дожидаясь синхронизации
+                        # Сразу чистим БД
                         with self.db_conn.cursor() as cur:
                             cur.execute(
                                 "UPDATE portfolio SET status = 'closed' WHERE symbol = %s",
@@ -1371,37 +1397,29 @@ class BybitSpotBot:
                         self.kelly_manager.update_trade_history(
                             {"pnl": pnl, "pnl_pct": pnl_pct}
                         )
-
-                        logger.info(f"   ✅ Продано (и закрыто в БД): {symbol}")
+                        logger.info(f"   ✅ Продано: {symbol}")
                     else:
                         logger.error(f"   ❌ Ошибка продажи: {symbol}")
 
-                # Обновляем данные после продаж
-                current_portfolio = self.get_current_portfolio()
+                # Обновляем баланс после продаж
                 available_balance = self.get_usdt_balance()
+                current_portfolio = self.get_current_portfolio()
 
-            # --- ПОКУПКА ---
-            # Пересчитываем свободные слоты на основе РЕАЛЬНЫХ позиций (> $2)
+            # --- БЛОК ПОКУПКИ ---
+            # Пересчитываем слоты
             real_positions_count = 0
             for sym, pos in current_portfolio.items():
                 if (pos["quantity"] * pos["current_price"]) > Decimal("2"):
                     real_positions_count += 1
 
-            # Принудительно обнуляем счетчик, если бот застрял в режиме снайпера, но позиций нет
-            if real_positions_count == 0 and len(current_portfolio) > 0:
-                logger.info(
-                    "🧹 Обнаружены фантомные позиции, игнорируем их для покупки."
-                )
-                real_positions_count = 0
-
             has_free_slots = real_positions_count < self.max_positions
             available_for_trading = available_balance - self.reserve_cash
 
-            # Размер позиции (защита от None)
             target_size = self.min_position_size
             if target_size is None:
                 target_size = Decimal("10")
 
+            # Если у нас $13, режим снайпера (max_positions=1), и нет позиций -> можно торговать
             can_trade = available_for_trading >= target_size
 
             if can_trade and has_free_slots:
@@ -1410,26 +1428,44 @@ class BybitSpotBot:
                     tickers, current_portfolio
                 )
 
-                # Лимит покупок за цикл
                 bought_count = 0
+                # Разрешаем купить до 3 монет за цикл, если позволяет депозит и слоты
+                max_buys_per_cycle = 3
 
                 for symbol, score, price, category in best_opportunities:
-                    if bought_count >= 1:
-                        break  # Покупаем по 1 за раз для безопасности
+                    if bought_count >= max_buys_per_cycle:
+                        break
 
+                    # Если включен режим снайпера (1 позиция), и мы уже что-то купили в этом цикле -> стоп
+                    if self.max_positions == 1 and bought_count >= 1:
+                        break
+
+                    # Базовый фильтр по скору
                     if score < Decimal("6"):
                         continue
 
-                    # Проверка денег (еще раз)
+                    # === НОВЫЙ ФИЛЬТР RSI ===
+                    rsi = self.calculate_rsi(symbol)
+                    # Если RSI > 75, пропускаем (слишком горячо)
+                    if rsi > Decimal("75"):
+                        logger.info(
+                            f"   ⚠️ Пропуск {symbol}: Перекуплен (RSI {rsi:.2f})"
+                        )
+                        continue
+                    # ========================
+
                     if available_for_trading < target_size:
                         break
 
-                    # Определяем размер позиции (Sniper mode = all in, иначе стандарт)
+                    # Расчет объема
                     buy_amount = target_size
                     if self.max_positions == 1:
-                        buy_amount = available_for_trading  # На все деньги
+                        # Если позиция одна, берем все доступное
+                        buy_amount = available_for_trading
 
-                    logger.info(f"🛒 ПОПЫТКА ПОКУПКИ {symbol} на {buy_amount:.2f} USDT")
+                    logger.info(
+                        f"🛒 ПОПЫТКА ПОКУПКИ {symbol} на {buy_amount:.2f} USDT (Score: {score:.1f}, RSI: {rsi:.1f})"
+                    )
 
                     success = self.smart_order_manager.execute_smart_buy(
                         symbol, buy_amount
@@ -1438,25 +1474,29 @@ class BybitSpotBot:
                     if success:
                         bought_count += 1
                         available_for_trading -= buy_amount
-                        # Запись в БД сделает следующая синхронизация или можно добавить тут
                         logger.info(f"✅ УСПЕШНАЯ ПОКУПКА: {symbol}")
+
+                        # Для режима снайпера сразу прерываем цикл, денег больше нет
+                        if self.max_positions == 1:
+                            break
                     else:
                         logger.error(f"❌ ОШИБКА ПОКУПКИ: {symbol}")
+
             else:
                 if not can_trade:
                     logger.info(
-                        f"💤 Ждем средств ({available_for_trading:.2f} < {target_size:.2f})"
+                        f"💤 Недостаточно средств ({available_for_trading:.2f} < {target_size:.2f})"
                     )
                 if not has_free_slots:
                     logger.info(
                         f"📦 Нет слотов ({real_positions_count}/{self.max_positions})"
                     )
 
-            # Отчеты и очистка
+            # Отчет раз в сутки
             if iteration % 288 == 0:
                 self.performance_analytics.generate_performance_report()
-            self.cleanup_old_cache()
 
+            self.cleanup_old_cache()
             return True
 
         except Exception as e:
