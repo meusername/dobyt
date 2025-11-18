@@ -691,73 +691,111 @@ class BybitSpotBot:
         return self.cached_tickers
 
     def safe_fetch_filtered_tickers(self):
-        """Безопасная загрузка и фильтрация тикеров для Bybit"""
+        """
+        ГИБРИДНАЯ ФИЛЬТРАЦИЯ (Smart Lite):
+        1. Берем Топ-30 по Объему (ликвидность).
+        2. Берем Топ-20 по Росту (потенциальные ракеты).
+        3. Объединяем и анализируем глубоко только их.
+        """
         try:
             tickers = self.exchange.fetch_tickers()
-            filtered = {}
-            MIN_24H_VOLUME = Decimal("100000")  # $100,000 минимальный объем
 
-            logger.info(f"🔍 Получено тикеров от биржи: {len(tickers)}")
+            # Снижаем порог объема до $30k, чтобы видеть начало пампов на микро-капах
+            MIN_VOLUME = Decimal("30000")
 
+            candidates = []
+
+            # 1. Первичная очистка
             for symbol, ticker in tickers.items():
                 try:
-                    # Фильтр: только USDT пары
                     if not symbol.endswith("/USDT"):
                         continue
-
-                    # Пропускаем стейблкоины
-                    base_symbol = symbol.replace("/USDT", "")
-                    if base_symbol in self.STABLECOINS:
+                    base = symbol.replace("/USDT", "")
+                    if base in self.STABLECOINS:
                         continue
 
-                    # Безопасное извлечение данных
-                    last_price = ticker.get("last")
-                    quote_volume = ticker.get("quoteVolume")
+                    last = ticker.get("last")
+                    vol = ticker.get("quoteVolume")
+                    change = ticker.get("percentage", 0)
 
-                    if last_price is None or quote_volume is None:
+                    if last is None or vol is None:
                         continue
 
-                    # Преобразуем в Decimal
-                    price = Decimal(str(last_price))
-                    volume = Decimal(str(quote_volume))
+                    price = Decimal(str(last))
+                    volume = Decimal(str(vol))
+                    change_pct = Decimal(str(change or 0))
 
-                    # Проверка объема и цены
-                    if volume < MIN_24H_VOLUME:
+                    if volume < MIN_VOLUME:
                         continue
-                    if price <= Decimal("0") or price > Decimal("100000"):
+                    if price <= Decimal("0"):
                         continue
 
-                    # Получаем изменение цены
-                    change_24h = Decimal("0")
-                    if ticker.get("percentage") is not None:
-                        change_24h = Decimal(str(ticker["percentage"])) / Decimal("100")
-
-                    # Расчет advanced_score
-                    ticker_data = {
-                        "symbol": symbol,
-                        "price": price,
-                        "volume": volume,
-                        "change_24h": change_24h,
-                    }
-
-                    enhanced_score = self.calculate_advanced_score(ticker_data)
-
-                    # Добавляем только если score > 0
-                    if enhanced_score > Decimal("0"):
-                        filtered[symbol] = {
+                    candidates.append(
+                        {
                             "symbol": symbol,
                             "price": price,
                             "volume": volume,
-                            "change_24h": change_24h,
-                            "base_symbol": base_symbol,
-                            "score": enhanced_score,
+                            "change_24h": change_pct,
+                            "base_symbol": base,
                         }
-
-                except Exception as e:
-                    logger.debug(f"⚠️ Пропущен тикер {symbol}: {e}")
+                    )
+                except:
                     continue
 
-            logger.info(f"✅ Успешно отфильтровано тикеров: {len(filtered)}")
+            if not candidates:
+                return {}
+
+            # 2. Стратегия отбора "Штанга" (Barbell Strategy)
+
+            # Группа А: Киты (Топ-30 по объему)
+            candidates.sort(key=lambda x: x["volume"], reverse=True)
+            top_volume = candidates[:30]
+
+            # Группа Б: Ракеты (Топ-20 по росту цены)
+            candidates.sort(key=lambda x: x["change_24h"], reverse=True)
+            top_gainers = candidates[:20]
+
+            # Объединяем и убираем дубликаты
+            unique_candidates = {
+                c["symbol"]: c for c in top_volume + top_gainers
+            }.values()
+
+            logger.info(
+                f"🏎 Быстрый анализ: отобрано {len(unique_candidates)} монет (Volume + Gainers)"
+            )
+
+            filtered = {}
+
+            # 3. Глубокий анализ (запросы к API)
+            for cand in unique_candidates:
+                try:
+                    # Запрашиваем свечи для Momentum Score
+                    score = self.calculate_advanced_score(
+                        {
+                            "symbol": cand["symbol"],
+                            "price": cand["price"],
+                            "volume": cand["volume"],
+                            "change_24h": cand["change_24h"]
+                            / 100,  # приводим к decimal 0.05
+                        }
+                    )
+
+                    # Логируем только хорошие находки, чтобы не спамить
+                    if score > Decimal("5"):
+                        logger.info(
+                            f"   ⭐ {cand['symbol']}: Score {score:.1f} | Рост {cand['change_24h']}%"
+                        )
+
+                    if score > Decimal("0"):
+                        cand["score"] = score
+                        # Нормализуем change_24h обратно в 0.XX формат для совместимости
+                        cand["change_24h"] = cand["change_24h"] / 100
+                        filtered[cand["symbol"]] = cand
+
+                except Exception as e:
+                    continue
+
+            logger.info(f"✅ Анализ завершен. Кандидатов для покупки: {len(filtered)}")
             return filtered
 
         except Exception as e:
