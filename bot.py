@@ -84,41 +84,50 @@ class SmartOrderManager:
     def execute_smart_buy(self, symbol, amount_usdt, max_slippage=Decimal("0.005")):
         """
         Быстрая покупка для малого депозита.
-        Использует лимитный ордер с запасом цены (Market-like),
-        чтобы гарантировать исполнение, но не купить слишком дорого.
+        Использует лимитный ордер с запасом цены (Market-like).
+        ИСПРАВЛЕНО: Корректный расчет объема во избежание Insufficient Balance.
         """
         try:
             # 1. Получаем актуальный стакан
             orderbook = self.exchange.fetch_order_book(symbol, limit=5)
             best_ask = float(orderbook["asks"][0][0])
-            best_bid = float(orderbook["bids"][0][0])
 
             # 2. Рассчитываем цену покупки с запасом 0.5% (гарантия исполнения)
-            # Если стакан плотный, исполнится по лучшей цене (best_ask).
-            # Если стакан пустой, мы не купим дороже чем +0.5%.
             buy_price = best_ask * 1.005
 
-            # 3. Рассчитываем количество
-            # Используем best_ask для расчета объема, чтобы хватило USDT
-            raw_quantity = float(amount_usdt) / best_ask
+            # 3. Рассчитываем количество ПРАВИЛЬНО
+            # Сначала уменьшаем сумму USDT на 1% (комиссия + запас на округление)
+            usable_usdt = float(amount_usdt) * 0.99
+
+            # Делим доступные деньги на ЦЕНУ ОРДЕРА (buy_price), а не на best_ask
+            raw_quantity = usable_usdt / buy_price
 
             # 4. Приводим к точности биржи
             symbol_precision = self.exchange.market(symbol)
 
-            # Проверка минимальной суммы ордера (Cost limits)
+            # Проверка минимальной стоимости (Cost limits)
             min_cost = symbol_precision["limits"]["cost"]["min"]
-            if min_cost and float(amount_usdt) < min_cost:
+            # Также проверяем min amount, если он есть
+            min_amount = symbol_precision["limits"]["amount"]["min"]
+
+            if min_cost and usable_usdt < min_cost:
                 logger.warning(
-                    f"⚠️ Сумма {amount_usdt} меньше минимума биржи {min_cost} для {symbol}"
+                    f"⚠️ Сумма {usable_usdt:.2f} меньше минимума по стоимости {min_cost} для {symbol}"
                 )
                 return False
 
-            # Округление цены и количества
+            if min_amount and raw_quantity < min_amount:
+                logger.warning(
+                    f"⚠️ Кол-во {raw_quantity} меньше минимума {min_amount} для {symbol}"
+                )
+                return False
+
+            # Округление цены и количества методами ccxt
             price_final = self.exchange.price_to_precision(symbol, buy_price)
             amount_final = self.exchange.amount_to_precision(symbol, raw_quantity)
 
             logger.info(
-                f"🛒 Попытка покупки {symbol}: {amount_final} шт. по цене до {price_final}"
+                f"🛒 Попытка покупки {symbol}: {amount_final} шт. по цене {price_final} (Сумма: {usable_usdt:.2f})"
             )
 
             # 5. Создаем ордер
@@ -674,34 +683,58 @@ class BybitSpotBot:
             return Decimal("5")
 
     def calculate_market_structure_score(self, ticker_data):
-        """Оценка структуры рынка"""
+        """
+        Оценка структуры рынка + EMA Trend Filter.
+        """
         try:
             symbol = ticker_data["symbol"]
-            ohlcv = self.exchange.fetch_ohlcv(symbol, "4h", limit=50)
-            if len(ohlcv) < 20:
-                return Decimal("5")
+            # Берем больше свечей для расчета EMA
+            ohlcv = self.exchange.fetch_ohlcv(symbol, "4h", limit=60)
+            if len(ohlcv) < 50:
+                return Decimal("5")  # Недостаточно данных
 
+            closes = [float(x[4]) for x in ohlcv]
             highs = [Decimal(str(x[2])) for x in ohlcv]
             lows = [Decimal(str(x[3])) for x in ohlcv]
             current_price = Decimal(str(ohlcv[-1][4]))
 
-            recent_high = max(highs[-10:])
-            recent_low = min(lows[-10:])
+            # --- EMA 50 FILTER ---
+            # Простой расчет EMA
+            df_closes = pd.Series(closes)
+            ema_50 = Decimal(str(df_closes.ewm(span=50, adjust=False).mean().iloc[-1]))
+
+            trend_score = Decimal("0")
+            if current_price > ema_50:
+                trend_score = Decimal("3")  # Бонус за восходящий тренд
+            else:
+                trend_score = Decimal("-2")  # Штраф за нисходящий тренд (цена под EMA)
+
+            # --- Price Position Logic ---
+            recent_high = max(highs[-20:])
+            recent_low = min(lows[-20:])
 
             if recent_high == recent_low:
-                return Decimal("5")
-
-            price_position = (current_price - recent_low) / (recent_high - recent_low)
-
-            if Decimal("0.3") <= price_position <= Decimal("0.7"):
-                return Decimal("8")
-            elif price_position < Decimal("0.3"):
-                return Decimal("6")
+                structure_score = Decimal("5")
             else:
-                return Decimal("4")
+                price_position = (current_price - recent_low) / (
+                    recent_high - recent_low
+                )
+
+                if Decimal("0.3") <= price_position <= Decimal("0.8"):
+                    structure_score = Decimal(
+                        "7"
+                    )  # Оптимально: не на дне и не на самом пике
+                elif price_position < Decimal("0.3"):
+                    structure_score = Decimal("5")  # Возможно дно, но опасно
+                else:
+                    structure_score = Decimal("3")  # Слишком дорого
+
+            # Итоговый балл (структура + тренд) ограничим от 0 до 10
+            total_score = structure_score + trend_score
+            return max(Decimal("0"), min(Decimal("10"), total_score))
 
         except Exception as e:
-            logger.warning(f"Ошибка анализа структуры: {e}")
+            logger.warning(f"Ошибка анализа структуры для {symbol}: {e}")
             return Decimal("5")
 
     def get_cached_tickers(self):
@@ -723,17 +756,11 @@ class BybitSpotBot:
 
     def safe_fetch_filtered_tickers(self):
         """
-        ГИБРИДНАЯ ФИЛЬТРАЦИЯ (Smart Lite):
-        1. Берем Топ-30 по Объему (ликвидность).
-        2. Берем Топ-20 по Росту (потенциальные ракеты).
-        3. Объединяем и анализируем глубоко только их.
+        ГИБРИДНАЯ ФИЛЬТРАЦИЯ (Smart Lite) с защитой от Rate Limit.
         """
         try:
             tickers = self.exchange.fetch_tickers()
-
-            # Снижаем порог объема до $30k, чтобы видеть начало пампов на микро-капах
             MIN_VOLUME = Decimal("30000")
-
             candidates = []
 
             # 1. Первичная очистка
@@ -776,23 +803,19 @@ class BybitSpotBot:
             if not candidates:
                 return {}
 
-            # 2. Стратегия отбора "Штанга" (Barbell Strategy)
-
-            # Группа А: Киты (Топ-30 по объему)
+            # 2. Стратегия отбора
             candidates.sort(key=lambda x: x["volume"], reverse=True)
             top_volume = candidates[:30]
 
-            # Группа Б: Ракеты (Топ-20 по росту цены)
             candidates.sort(key=lambda x: x["change_24h"], reverse=True)
             top_gainers = candidates[:20]
 
-            # Объединяем и убираем дубликаты
             unique_candidates = {
                 c["symbol"]: c for c in top_volume + top_gainers
             }.values()
 
             logger.info(
-                f"🏎 Быстрый анализ: отобрано {len(unique_candidates)} монет (Volume + Gainers)"
+                f"🏎 Быстрый анализ: отобрано {len(unique_candidates)} монет. Запуск скоринга..."
             )
 
             filtered = {}
@@ -800,30 +823,28 @@ class BybitSpotBot:
             # 3. Глубокий анализ (запросы к API)
             for cand in unique_candidates:
                 try:
+                    # !!! ВАЖНО: Пауза чтобы не получить бан API !!!
+                    time.sleep(0.2)
+
                     # Запрашиваем свечи для Momentum Score
                     score = self.calculate_advanced_score(
                         {
                             "symbol": cand["symbol"],
                             "price": cand["price"],
                             "volume": cand["volume"],
-                            "change_24h": cand["change_24h"]
-                            / 100,  # приводим к decimal 0.05
+                            "change_24h": cand["change_24h"] / 100,
                         }
                     )
 
-                    # Логируем только хорошие находки, чтобы не спамить
                     if score > Decimal("5"):
-                        logger.info(
-                            f"   ⭐ {cand['symbol']}: Score {score:.1f} | Рост {cand['change_24h']}%"
-                        )
-
-                    if score > Decimal("0"):
                         cand["score"] = score
-                        # Нормализуем change_24h обратно в 0.XX формат для совместимости
+                        # Нормализуем change_24h
                         cand["change_24h"] = cand["change_24h"] / 100
                         filtered[cand["symbol"]] = cand
+                        logger.info(f"   ⭐ {cand['symbol']}: Score {score:.1f}")
 
                 except Exception as e:
+                    logger.warning(f"Ошибка анализа {cand['symbol']}: {e}")
                     continue
 
             logger.info(f"✅ Анализ завершен. Кандидатов для покупки: {len(filtered)}")
@@ -1583,60 +1604,60 @@ class BybitSpotBot:
             return Decimal("0")
 
     def auto_adjust_parameters(self):
-        """Адаптация под депозит $10"""
+        """Адаптация под реальный депозит (исправленная логика)."""
         try:
             real_balance = self.get_usdt_balance()
-            logger.info(f"💰 Реальный баланс для настройки: {real_balance}")
 
-            if real_balance < Decimal("15"):
-                # === РЕЖИМ МИКРО-ДЕПОЗИТА ($10) ===
-                # ВРЕМЕННО: Ставим 5 позиций, чтобы бот мог покупать на свободные $13,
-                # даже если старые слоты заняты.
-                self.max_positions = 5
-                self.reserve_cash = Decimal("1")
+            # Получаем текущее количество активных позиций
+            active_positions = len(self.get_current_portfolio())
+
+            logger.info(
+                f"💰 Реальный баланс: {real_balance:.2f} | Позиций: {active_positions}"
+            )
+
+            if real_balance < Decimal("20"):
+                # === РЕЖИМ МИКРО-ДЕПОЗИТА (< $20) ===
+                # Стратегия: Снайпер (одна точная сделка на весь объем)
+                # Причина: Если разбить $15 на 3 части по $5, комиссии и проскальзывания съедят прибыль.
+
+                self.max_positions = 1
+                self.reserve_cash = Decimal("1")  # $1 на всякий случай
 
                 available = real_balance - self.reserve_cash
 
-                # Все еще пытаемся зайти "на все", но не менее 5.1
-                if available < Decimal("5.1"):
-                    self.min_position_size = available
+                # Если у нас уже есть позиция, новые не открываем
+                if active_positions >= 1:
+                    self.min_position_size = Decimal("999999")  # Блокируем покупку
+                    self.max_position_size = Decimal("999999")
                 else:
-                    self.min_position_size = Decimal("5.1")
+                    # Если позиций нет, заходим "на всю котлету" (но не меньше $5.5)
+                    trade_amount = max(Decimal("5.5"), available)
+                    self.min_position_size = trade_amount
+                    self.max_position_size = trade_amount * Decimal(
+                        "1.1"
+                    )  # чуть больше для гибкости
 
-                # Ограничим макс позицию $15, чтобы не слить всё в одну новую сделку
-                self.max_position_size = Decimal("15")
+                logger.info("⚠️ РЕЖИМ <$20: Макс 1 позиция (Sniper Mode)")
 
-                logger.info(
-                    "⚠️ РЕЖИМ $10 (Расширенный): Разрешаем новые сделки поверх старых"
-                )
-                self.reserve_cash = Decimal("1")  # Оставляем $1 на комиссию
-
-                # Пытаемся использовать все доступные деньги для одной сделки
-                available = real_balance - self.reserve_cash
-
-                # Защита от слишком мелкого ордера
-                if available < Decimal("5.1"):
-                    self.min_position_size = available  # Пытаемся зайти на все что есть
-                else:
-                    self.min_position_size = Decimal("5.1")
-
-                self.max_position_size = available  # Максимум = весь свободный кэш
-
-                logger.info("⚠️ ВКЛЮЧЕН РЕЖИМ $10: 1 позиция, All-in вход")
-
-            elif real_balance < Decimal("30"):
-                # $15-$30
+            elif real_balance < Decimal("50"):
+                # === РЕЖИМ МАЛОГО ДЕПОЗИТА ($20 - $50) ===
                 self.max_positions = 2
-                self.min_position_size = Decimal("6")
-                self.max_position_size = real_balance * Decimal("0.45")
                 self.reserve_cash = Decimal("2")
 
+                share = (real_balance - self.reserve_cash) / 2
+                self.min_position_size = max(Decimal("6"), share * Decimal("0.9"))
+                self.max_position_size = max(Decimal("6"), share * Decimal("1.1"))
+
+                logger.info("⚠️ РЕЖИМ $20-$50: Макс 2 позиции")
+
             else:
-                # Стандартная логика
-                self.max_positions = 3
-                self.min_position_size = Decimal("10")
-                self.max_position_size = real_balance * Decimal("0.3")
+                # === СТАНДАРТНЫЙ РЕЖИМ (> $50) ===
+                self.max_positions = 3  # Или больше, если баланс растет
                 self.reserve_cash = Decimal("5")
+
+                share = (real_balance - self.reserve_cash) / Decimal("3")
+                self.min_position_size = max(Decimal("10"), share * Decimal("0.8"))
+                self.max_position_size = max(Decimal("12"), share * Decimal("1.2"))
 
             # Синхронизируем с менеджером капитала
             self.kelly_manager.total_capital = real_balance
