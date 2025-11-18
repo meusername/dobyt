@@ -143,44 +143,56 @@ class SmartOrderManager:
         self, symbol, quantity, current_price=None, max_slippage=Decimal("0.005")
     ):
         """
-        Умная продажа: Проверяет реальный баланс перед продажей, чтобы избежать ошибки 'Insufficient balance'.
+        Умная продажа с жесткой проверкой лимитов.
         """
         try:
-            # 1. Получаем реальный доступный баланс монеты с биржи
+            # 1. Получаем баланс
             base_currency = symbol.split("/")[0]
             balance = self.exchange.fetch_balance()
-
-            # Ищем баланс (учитываем возможные структуры ответа)
             available = 0
             if "free" in balance and base_currency in balance["free"]:
                 available = float(balance["free"][base_currency])
 
             if available <= 0:
+                return False
+
+            # 2. Получаем лимиты рынка
+            market = self.exchange.market(symbol)
+            min_amount = market["limits"]["amount"]["min"]
+
+            # Если доступно меньше минимума - это пыль, продать нельзя
+            if available < min_amount:
                 logger.warning(
-                    f"⚠️ Попытка продажи {symbol}, но баланс {base_currency} = 0"
+                    f"🧹 Пыль {symbol}: {available} < {min_amount}. Невозможно продать."
                 )
                 return False
 
-            # Используем реальный баланс, если он меньше или чуть больше запрошенного (чтобы продать хвосты)
-            # Если разница небольшая (<10%), продаем всё, чтобы не оставлять пыль.
-            sell_quantity = available
+            # 3. Округляем ВНИЗ до точности биржи (чтобы не было ошибки Insufficient Balance)
+            # ccxt amount_to_precision обычно округляет математически, нам нужно truncate
+            amount_final = self.exchange.amount_to_precision(symbol, available)
 
-            # 2. Получаем стакан
+            # Если после округления получилось больше, чем есть (из-за float), чуть уменьшаем
+            if float(amount_final) > available:
+                amount_final = self.exchange.amount_to_precision(
+                    symbol, available * 0.999
+                )
+
+            # 4. Цена
             orderbook = self.exchange.fetch_order_book(symbol, limit=5)
             best_bid = float(orderbook["bids"][0][0])
-
-            # 3. Цена продажи (чуть ниже рынка для скорости)
-            sell_price = best_bid * 0.995
-
-            # 4. Округление
+            sell_price = best_bid * 0.995  # -0.5%
             price_final = self.exchange.price_to_precision(symbol, sell_price)
-            amount_final = self.exchange.amount_to_precision(symbol, sell_quantity)
 
-            logger.info(
-                f"🔻 Продажа {symbol}: {amount_final} (доступно: {available}) по {price_final}"
-            )
+            # Проверка на минимальную стоимость ордера ($5)
+            notional = float(amount_final) * float(price_final)
+            if notional < 5:
+                logger.warning(
+                    f"💰 Ордер {symbol} слишком мал (${notional:.2f} < $5). Невозможно продать."
+                )
+                return False
 
-            # 5. Создаем ордер
+            logger.info(f"🔻 Продажа {symbol}: {amount_final} по {price_final}")
+
             order = self.exchange.create_order(
                 symbol=symbol,
                 type="limit",
@@ -1578,7 +1590,25 @@ class BybitSpotBot:
 
             if real_balance < Decimal("15"):
                 # === РЕЖИМ МИКРО-ДЕПОЗИТА ($10) ===
-                self.max_positions = 1  # ТОЛЬКО 1 позиция
+                # ВРЕМЕННО: Ставим 5 позиций, чтобы бот мог покупать на свободные $13,
+                # даже если старые слоты заняты.
+                self.max_positions = 5
+                self.reserve_cash = Decimal("1")
+
+                available = real_balance - self.reserve_cash
+
+                # Все еще пытаемся зайти "на все", но не менее 5.1
+                if available < Decimal("5.1"):
+                    self.min_position_size = available
+                else:
+                    self.min_position_size = Decimal("5.1")
+
+                # Ограничим макс позицию $15, чтобы не слить всё в одну новую сделку
+                self.max_position_size = Decimal("15")
+
+                logger.info(
+                    "⚠️ РЕЖИМ $10 (Расширенный): Разрешаем новые сделки поверх старых"
+                )
                 self.reserve_cash = Decimal("1")  # Оставляем $1 на комиссию
 
                 # Пытаемся использовать все доступные деньги для одной сделки
