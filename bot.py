@@ -441,10 +441,10 @@ class BybitSpotBot:
 
         # Параметры БД
         self.db_config = {
-            "host": os.getenv("DB_HOST", "postgres"),
-            "database": os.getenv("DB_NAME", "bybit_bot"),
-            "user": os.getenv("DB_USER", "trader"),
-            "password": os.getenv("DB_PASSWORD", "trading_password"),
+            "host": os.getenv("DB_HOST", "127.0.0.1"),
+            "database": os.getenv("DB_NAME", "dobyt"),
+            "user": os.getenv("DB_USER", "trading_user"),
+            "password": os.getenv("DB_PASSWORD", "bitpa$$w0rd"),
             "port": os.getenv("DB_PORT", "5432"),
         }
 
