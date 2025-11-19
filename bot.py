@@ -1178,14 +1178,33 @@ class BybitSpotBot:
             current_portfolio = self.get_current_portfolio()
 
             # Логируем только реальные позиции > $2
-            real_pos = [
-                k
-                for k, v in current_portfolio.items()
-                if (v["quantity"] * v["current_price"]) > Decimal("2")
-            ]
+            real_pos = []
+            for k, v in current_portfolio.items():
+                val = v["quantity"] * v["current_price"]
+                if val > Decimal("2"):
+                    real_pos.append(k)
+
             logger.info("📊 ТЕКУЩИЙ СТАТУС:")
             logger.info(f"   💰 Баланс: {available_balance:.2f} USDT")
             logger.info(f"   📦 Позиций: {len(real_pos)}/{self.max_positions}")
+
+            # === ДОБАВЛЕНО: ВЫВОД ТЕКУЩИХ ПОЗИЦИЙ ===
+            if real_pos:
+                logger.info("   💎 УДЕРЖИВАЕМЫЕ АКТИВЫ:")
+                for symbol in real_pos:
+                    pos = current_portfolio[symbol]
+                    q = pos["quantity"]
+                    ep = pos["entry_price"]
+                    cp = pos["current_price"]
+
+                    # Считаем PnL
+                    pnl_val = (cp - ep) * q
+                    pnl_pct = ((cp / ep) - 1) * 100
+
+                    icon = "🟢" if pnl_val >= 0 else "🔴"
+                    logger.info(
+                        f"      {icon} {symbol}: {pnl_pct:.2f}% (${pnl_val:.4f}) | Цена: {cp}"
+                    )
 
             # --- ПРОДАЖА ---
             positions_to_sell = self.check_stop_conditions(current_portfolio, tickers)
