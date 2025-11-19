@@ -2535,24 +2535,26 @@ class BybitSpotBot:
 
     # --- MAIN LOOP ---
     def enhanced_rebalance(self, iteration):
+        """
+        Двухскоростная ребалансировка:
+        - Проверка стопов: Каждую итерацию (быстро).
+        - Поиск новых монет: Только раз в 5 минут (медленно).
+        """
         try:
-            if iteration <= 1:
-                logger.info("🔄 Обновление тикеров...")
-                self.cached_tickers = self.safe_fetch_filtered_tickers()
-
-            logger.info(f"🔄 Итерация #{iteration}")
-            self.auto_adjust_parameters()
+            # 1. СИНХРОНИЗАЦИЯ И БАЛАНС (Делаем всегда)
+            # Это легкие запросы, можно делать часто
             self.sync_portfolio_with_exchange()
-
             balance = self.get_usdt_balance()
             portfolio = self.get_current_portfolio()
-            tickers = self.get_cached_tickers()
 
-            # 1. Рыночный режим
-            market_status = self.get_market_regime()
-            logger.info(f"🌍 Рынок (BTC): {market_status}")
+            # Определяем, нужно ли запускать "Тяжелый сканер"
+            # Запускаем сканер, только если прошло 300 секунд с прошлого раза
+            # ИЛИ если это первый запуск
+            current_time = time.time()
+            last_scan = getattr(self, "last_scan_time", 0)
+            should_scan = (current_time - last_scan) > 300 or iteration == 1
 
-            # Логирование
+            # Логирование статуса (каждую итерацию, чтобы видеть динамику)
             real_pos = []
             for s, p in portfolio.items():
                 val = p["quantity"] * p["current_price"]
@@ -2564,17 +2566,36 @@ class BybitSpotBot:
             )
             for s in real_pos:
                 p = portfolio[s]
-                pnl = (p["current_price"] / p["entry_price"] - 1) * 100
-                logger.info(f"   💎 {s}: {pnl:.2f}% | Цена {p['current_price']}")
+                entry = p["entry_price"]
+                curr = p["current_price"]
+                # Защита от деления на ноль
+                if entry > 0:
+                    pnl = (curr / entry - 1) * 100
+                else:
+                    pnl = Decimal("0")
 
-            # ПРОДАЖА
-            to_sell = self.check_stop_conditions(portfolio, tickers)
+                # Добавим RSI в лог для понимания ситуации
+                rsi = self.calculate_rsi(s)
+                logger.info(f"   💎 {s}: {pnl:.2f}% | Цена {curr} | RSI {rsi:.1f}")
+
+            # --- БЛОК 1: ПРОДАЖА (ЗАЩИТА) ---
+            # Запускается КАЖДУЮ итерацию (каждые 20 сек)
+            # Нам нужны актуальные цены ТОЛЬКО для наших монет
+            my_tickers = {}
+            for symbol in real_pos:
+                try:
+                    t = self.exchange.fetch_ticker(symbol.replace("/", ""))
+                    my_tickers[symbol] = {"price": Decimal(str(t["last"]))}
+                except:
+                    pass
+
+            to_sell = self.check_stop_conditions(portfolio, my_tickers)
+
             for sym, pos, price, reason in to_sell:
                 logger.info(f"🔻 Продажа {sym}: {reason}")
                 if self.smart_order_manager.execute_smart_sell(
                     sym, pos["quantity"], price
                 ):
-                    # Запись в БД
                     q = float(pos["quantity"])
                     ep = float(pos["entry_price"])
                     cp = float(price)
@@ -2583,20 +2604,24 @@ class BybitSpotBot:
                     with self.db_conn.cursor() as cur:
                         cur.execute(
                             """
-                            UPDATE portfolio SET status='closed', exit_price=%s, exit_time=NOW(), profit_loss=%s
-                            WHERE symbol=%s AND status='active'
-                        """,
+                                UPDATE portfolio SET status='closed', exit_price=%s, exit_time=NOW(), profit_loss=%s
+                                WHERE symbol=%s AND status='active'
+                            """,
                             (cp, pnl, sym),
                         )
                     self.db_conn.commit()
                     logger.info(f"✅ Закрыто: {sym} (PnL {pnl:.4f})")
 
-            # ПОКУПКА
-            # Пересчет после продаж
-            balance = self.get_usdt_balance()
-            portfolio = self.get_current_portfolio()
+                    # Обновляем данные сразу после продажи
+                    balance = self.get_usdt_balance()
+                    portfolio = self.get_current_portfolio()
+                    # Если продали, можно сразу разрешить поиск, не ожидая таймера
+                    should_scan = True
 
-            # Считаем реальные слоты
+            # --- БЛОК 2: ПОКУПКА (СКАНИРОВАНИЕ) ---
+            # Запускается РЕДКО (раз в 5 минут) или если освободился слот
+
+            # Есть ли смысл сканировать? (Есть деньги и слоты)
             busy_slots = len(
                 [
                     k
@@ -2604,24 +2629,37 @@ class BybitSpotBot:
                     if v["quantity"] * v["current_price"] > 2
                 ]
             )
+            self.auto_adjust_parameters()  # Обновим лимиты
 
-            if busy_slots < self.max_positions and balance > self.min_position_size:
+            can_buy = (
+                busy_slots < self.max_positions and balance > self.min_position_size
+            )
+
+            if can_buy and should_scan:
+                logger.info("🔍 Запуск сканера рынка (ищем новые монеты)...")
+
+                # Обновляем глобальные тикеры только здесь (ТЯЖЕЛАЯ ОПЕРАЦИЯ)
+                self.cached_tickers = self.safe_fetch_filtered_tickers()
+                self.last_scan_time = time.time()
+                tickers = self.cached_tickers
+
+                # Проверка рынка
+                market_status = self.get_market_regime()
+                logger.info(f"🌍 Рынок (BTC): {market_status}")
+
                 if market_status == "danger":
-                    logger.info("🔥 Рынок перегрет, не покупаем")
+                    logger.info("🔥 Рынок перегрет, пропускаем цикл покупки")
                     return True
 
                 opps = self.find_optimized_opportunities(tickers, portfolio)
-                for sym, score, price, cat in opps:
-                    # RSI Фильтр
-                    if self.calculate_rsi(sym) > Decimal("75"):
-                        logger.info(f"⚠️ {sym} RSI перегрет")
-                        continue
 
-                    # Медвежий фильтр (строже отбор)
+                for sym, score, price, cat in opps:
+                    # Повторные проверки перед входом
+                    if self.calculate_rsi(sym) > Decimal("75"):
+                        continue
                     if market_status == "bear" and score < Decimal("8"):
                         continue
 
-                    # Размер позиции
                     amount = self.min_position_size
                     if self.max_positions == 1:
                         amount = balance - self.reserve_cash
@@ -2630,10 +2668,19 @@ class BybitSpotBot:
                     if self.smart_order_manager.execute_smart_buy(sym, amount):
                         logger.info("✅ Куплено")
                         break  # 1 покупка за цикл
-            else:
-                logger.info("💤 Нет слотов или средств")
 
+            elif not can_buy and should_scan:
+                # Если сканировать пора, но нет мест - просто обновим время,
+                # чтобы не пытаться сканировать каждую следующую секунду
+                self.last_scan_time = time.time()
+                logger.info("💤 Нет мест для покупки, сканирование отложено.")
+
+            if iteration % 288 == 0:
+                self.performance_analytics.generate_performance_report()
+
+            self.cleanup_old_cache()
             return True
+
         except Exception as e:
             logger.error(f"Ошибка цикла: {e}")
             import traceback
@@ -2643,13 +2690,11 @@ class BybitSpotBot:
 
     def run_optimized(self):
         """Основной цикл работы бота"""
-        logger.info("🚀 Запуск хедж-фонд бота Bybit")
+        logger.info("🚀 Запуск Fast-Response бота Bybit")
 
-        # Проверка начального состояния
         try:
             balance = self.get_usdt_balance()
             if balance <= Decimal("0"):
-                # Если баланс 0, но есть позиции в БД - работаем, иначе стоп
                 p = self.get_current_portfolio()
                 if not p:
                     logger.error("❌ Баланс 0 и портфель пуст. Пополните депозит.")
@@ -2660,35 +2705,41 @@ class BybitSpotBot:
         iteration = 0
         consecutive_errors = 0
 
+        # Инициализируем время сканирования в прошлом, чтобы первый запуск сработал сразу
+        self.last_scan_time = 0
+
         while True:
             try:
                 iteration += 1
 
-                # Переподключение к БД если соединение разорвано
                 if not self.db_conn or self.db_conn.closed:
                     logger.info("🔄 Переподключение к БД...")
                     self.db_conn = self.init_db()
 
-                # Запуск логики одной итерации
                 success = self.enhanced_rebalance(iteration)
 
                 if success:
                     consecutive_errors = 0
+                    # === ИЗМЕНЕНИЕ ЗДЕСЬ ===
+                    # Ждем всего 20 секунд вместо 300.
+                    # В enhanced_rebalance стоит логика, которая не даст
+                    # спамить сканированием рынка, но позволит проверить стопы.
+                    wait_time = 20
                     logger.info(
-                        f"⏳ Ждем {self.rebalance_interval} сек до следующего цикла..."
+                        f"⏳ Мониторинг... (след. проверка через {wait_time} сек)"
                     )
-                    time.sleep(self.rebalance_interval)
+                    time.sleep(wait_time)
                 else:
                     consecutive_errors += 1
                     sleep_time = 60 if consecutive_errors < 3 else 300
-                    logger.warning(f"⚠️ Ошибка в цикле. Пауза {sleep_time} сек.")
+                    logger.warning(f"⚠️ Ошибка. Пауза {sleep_time} сек.")
                     time.sleep(sleep_time)
 
             except KeyboardInterrupt:
-                logger.info("\n⏹️ Остановка бота пользователем...")
+                logger.info("\n⏹️ Остановка...")
                 break
             except Exception as e:
-                logger.error(f"❌ Критическая ошибка в main loop: {e}")
+                logger.error(f"❌ Ошибка main loop: {e}")
                 time.sleep(60)
 
 
