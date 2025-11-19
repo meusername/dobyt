@@ -2641,6 +2641,56 @@ class BybitSpotBot:
             logger.error(traceback.format_exc())
             return False
 
+    def run_optimized(self):
+        """Основной цикл работы бота"""
+        logger.info("🚀 Запуск хедж-фонд бота Bybit")
+
+        # Проверка начального состояния
+        try:
+            balance = self.get_usdt_balance()
+            if balance <= Decimal("0"):
+                # Если баланс 0, но есть позиции в БД - работаем, иначе стоп
+                p = self.get_current_portfolio()
+                if not p:
+                    logger.error("❌ Баланс 0 и портфель пуст. Пополните депозит.")
+                    return
+        except Exception as e:
+            logger.error(f"Ошибка инициализации: {e}")
+
+        iteration = 0
+        consecutive_errors = 0
+
+        while True:
+            try:
+                iteration += 1
+
+                # Переподключение к БД если соединение разорвано
+                if not self.db_conn or self.db_conn.closed:
+                    logger.info("🔄 Переподключение к БД...")
+                    self.db_conn = self.init_db()
+
+                # Запуск логики одной итерации
+                success = self.enhanced_rebalance(iteration)
+
+                if success:
+                    consecutive_errors = 0
+                    logger.info(
+                        f"⏳ Ждем {self.rebalance_interval} сек до следующего цикла..."
+                    )
+                    time.sleep(self.rebalance_interval)
+                else:
+                    consecutive_errors += 1
+                    sleep_time = 60 if consecutive_errors < 3 else 300
+                    logger.warning(f"⚠️ Ошибка в цикле. Пауза {sleep_time} сек.")
+                    time.sleep(sleep_time)
+
+            except KeyboardInterrupt:
+                logger.info("\n⏹️ Остановка бота пользователем...")
+                break
+            except Exception as e:
+                logger.error(f"❌ Критическая ошибка в main loop: {e}")
+                time.sleep(60)
+
 
 if __name__ == "__main__":
     required_env_vars = ["BYBIT_API_KEY", "BYBIT_API_SECRET"]
