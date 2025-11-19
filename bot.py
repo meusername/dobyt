@@ -380,6 +380,7 @@ class PerformanceAnalytics:
         return report
 
 
+'''
 class BybitSpotBot:
     def __init__(self):
         self.exchange = ccxt.bybit(
@@ -1902,6 +1903,743 @@ class BybitSpotBot:
         except Exception as e:
             logger.error(f"❌ Ошибка очистки пыли: {e}")
             self.db_conn.rollback()
+'''
+
+
+class BybitSpotBot:
+    def __init__(self):
+        self.exchange = ccxt.bybit(
+            {
+                "apiKey": os.getenv("BYBIT_API_KEY"),
+                "secret": os.getenv("BYBIT_API_SECRET"),
+                "enableRateLimit": True,
+                "sandbox": False,
+                "rateLimit": 100,
+                "options": {"defaultType": "spot"},
+            }
+        )
+
+        try:
+            markets = self.exchange.load_markets()
+            logger.info(f"✅ Успешно подключено к Bybit. Доступно пар: {len(markets)}")
+        except Exception as e:
+            logger.error(f"❌ Ошибка подключения к Bybit: {e}")
+            raise
+
+        # --- ПАРАМЕТРЫ КАПИТАЛА ---
+        self.total_capital = Decimal("20")
+        self.kelly_manager = KellyCapitalManagement(self.total_capital)
+        self.performance_analytics = PerformanceAnalytics()
+        self.smart_order_manager = SmartOrderManager(self.exchange)
+
+        # Интервалы
+        self.rebalance_interval = 300  # 5 минут
+        self.tickers_cache_ttl = 60
+
+        # Настройки позиций (будут перезаписаны в auto_adjust_parameters)
+        self.max_positions = 1
+        self.min_position_size = Decimal("5")
+        self.max_position_size = Decimal("15")
+        self.reserve_cash = Decimal("2")
+
+        # --- ПАРАМЕТРЫ СТРАТЕГИИ (Базовые) ---
+        self.initial_stop_atr = Decimal("2.0")
+        self.take_profit_atr = Decimal("3.0")
+        self.min_order = Decimal("5")
+        self.commission = Decimal("0.001")
+
+        # --- STABLECOINS ---
+        self.STABLECOINS = [
+            "USDC",
+            "TUSD",
+            "FDUSD",
+            "USDD",
+            "BUSD",
+            "DAI",
+            "PAX",
+            "GUSD",
+            "EURT",
+        ]
+
+        # Кэш
+        self.atr_cache = {}
+        self.atr_cache_ttl = 3600
+        self.last_tickers_update = None
+        self.cached_tickers = {}
+        self.last_status_log = 0
+        self.status_log_interval = 60
+
+        # Трейлинг и защита
+        self.trailing_stop_max_prices = {}
+
+        # БД
+        self.db_config = {
+            "host": os.getenv("DB_HOST", "127.0.0.1"),
+            "database": os.getenv("DB_NAME", "dobyt"),
+            "user": os.getenv("DB_USER", "trading_user"),
+            "password": os.getenv("DB_PASSWORD", "bitpa$$w0rd"),
+            "port": os.getenv("DB_PORT", "5432"),
+        }
+
+        self.db_conn = self.init_db()
+        if self.db_conn:
+            self.cleanup_invalid_symbols()
+            self.cleanup_dust_positions()
+            logger.info("🔄 Первоначальная синхронизация...")
+            self.sync_portfolio_with_exchange()
+        else:
+            logger.warning("⚠️ Работа без БД!")
+
+        if not self.health_check():
+            raise Exception("Health check failed")
+
+    def init_db(self):
+        """Инициализация БД"""
+        try:
+            conn = psycopg2.connect(**self.db_config)
+            with conn.cursor() as cur:
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS portfolio (
+                        id SERIAL PRIMARY KEY,
+                        symbol VARCHAR(50) NOT NULL,
+                        quantity DECIMAL(20,8) NOT NULL,
+                        entry_price DECIMAL(20,8) NOT NULL,
+                        current_price DECIMAL(20,8),
+                        entry_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        exit_price DECIMAL(20,8),
+                        exit_time TIMESTAMP,
+                        profit_loss DECIMAL(10,4),
+                        status VARCHAR(10) DEFAULT 'active'
+                    )
+                """)
+                cur.execute("""
+                    CREATE UNIQUE INDEX IF NOT EXISTS idx_active_symbol
+                    ON portfolio (symbol)
+                    WHERE status = 'active';
+                """)
+            conn.commit()
+            return conn
+        except Exception as e:
+            logger.error(f"❌ Ошибка БД: {e}")
+            return None
+
+    # --- МЕТОД 1: BTC FILTER (Рыночный режим) ---
+    def get_market_regime(self):
+        """
+        Определяет состояние рынка по BTC.
+        Returns: 'bull', 'bear', 'danger' (перегрет).
+        """
+        try:
+            # Качаем BTC 4h (глобальный тренд)
+            ohlcv = self.exchange.fetch_ohlcv("BTC/USDT", "4h", limit=200)
+            if not ohlcv or len(ohlcv) < 100:
+                return "bull"
+
+            closes = [float(x[4]) for x in ohlcv]
+            df = pd.Series(closes)
+
+            # EMA 200
+            ema_200 = df.ewm(span=200, adjust=False).mean().iloc[-1]
+            current_price = closes[-1]
+
+            # RSI 14
+            delta = df.diff()
+            gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
+            loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+            rs = gain / loss.replace(0, 0.0000001)
+            rsi = 100 - (100 / (1 + rs))
+            rsi_val = rsi.iloc[-1]
+
+            if rsi_val > 80:
+                return "danger"  # BTC перегрет
+            elif current_price < ema_200:
+                return "bear"  # Нисходящий тренд
+            else:
+                return "bull"  # Восходящий тренд
+        except Exception as e:
+            logger.error(f"Ошибка анализа BTC: {e}")
+            return "bull"
+
+    def calculate_atr(self, symbol, period=14):
+        try:
+            cache_key = f"{symbol}_{period}"
+            if cache_key in self.atr_cache:
+                ts, val = self.atr_cache[cache_key]
+                if time.time() - ts < self.atr_cache_ttl:
+                    return val
+
+            ohlcv = self.exchange.fetch_ohlcv(symbol, "1d", limit=period + 5)
+            if len(ohlcv) < period + 1:
+                return Decimal("0.05")
+
+            highs = np.array([float(x[2]) for x in ohlcv])
+            lows = np.array([float(x[3]) for x in ohlcv])
+            closes = np.array([float(x[4]) for x in ohlcv])
+
+            tr = np.maximum(
+                highs[1:] - lows[1:],
+                np.maximum(
+                    np.abs(highs[1:] - closes[:-1]), np.abs(lows[1:] - closes[:-1])
+                ),
+            )
+            atr = np.mean(tr[-period:])
+            atr_pct = Decimal(str(atr / closes[-1]))
+
+            self.atr_cache[cache_key] = (time.time(), atr_pct)
+            return atr_pct
+        except:
+            return Decimal("0.05")
+
+    def calculate_rsi(self, symbol, period=14):
+        try:
+            ohlcv = self.exchange.fetch_ohlcv(symbol, "15m", limit=100)
+            if len(ohlcv) < period + 1:
+                return Decimal("50")
+            closes = [float(x[4]) for x in ohlcv]
+            df = pd.Series(closes)
+            delta = df.diff()
+            gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
+            loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
+            rs = gain / loss.replace(0, 0.0000001)
+            rsi = 100 - (100 / (1 + rs))
+            return Decimal(str(rsi.iloc[-1]))
+        except:
+            return Decimal("50")
+
+    # --- МЕТОД 2 & 3: SCORING ENGINE (OBV + Bollinger) ---
+    def calculate_advanced_score(self, ticker_data):
+        """Мульти-факторный скоринг: Momentum + OBV + Bollinger."""
+        try:
+            symbol = ticker_data["symbol"]
+
+            # Качаем данные (1h таймфрейм для анализа структуры)
+            ohlcv = self.exchange.fetch_ohlcv(symbol, "1h", limit=100)
+            if len(ohlcv) < 50:
+                return Decimal("0")
+
+            df = pd.DataFrame(
+                ohlcv, columns=["time", "open", "high", "low", "close", "volume"]
+            )
+            current_price = df["close"].iloc[-1]
+
+            # 1. Momentum (Цена растет?)
+            closes = df["close"]
+            ema_20 = closes.ewm(span=20, adjust=False).mean().iloc[-1]
+            mom_score = Decimal("5")
+            if current_price > ema_20:
+                mom_score = Decimal("8")
+            else:
+                mom_score = Decimal("3")
+
+            # 2. OBV (Деньги заходят?)
+            obv = (np.sign(df["close"].diff()) * df["volume"]).fillna(0).cumsum()
+            obv_sma = obv.rolling(20).mean().iloc[-1]
+            current_obv = obv.iloc[-1]
+
+            obv_score = Decimal("5")
+            if current_obv > obv_sma:
+                obv_score = Decimal("8")  # Деньги заходят
+            elif current_obv < obv_sma:
+                obv_score = Decimal("3")  # Деньги выходят
+
+            # 3. Bollinger Bands (Перекупленность?)
+            sma = closes.rolling(20).mean()
+            std = closes.rolling(20).std()
+            upper_bb = (sma + 2 * std).iloc[-1]
+            lower_bb = (sma - 2 * std).iloc[-1]
+
+            bb_score = Decimal("5")
+            if current_price > upper_bb:
+                bb_score = Decimal("2")  # Слишком дорого, риск отката
+            elif current_price < lower_bb:
+                bb_score = Decimal("4")  # Дешево, но может быть падение
+            elif current_price > sma.iloc[-1]:
+                bb_score = Decimal("7")  # В верхней половине, здоровый тренд
+
+            # Взвешенная сумма
+            # Momentum 40%, OBV 30%, BB 30%
+            final_score = (
+                (mom_score * Decimal("0.4"))
+                + (obv_score * Decimal("0.3"))
+                + (bb_score * Decimal("0.3"))
+            )
+
+            # Дополнительный буст от ticker change_24h (из аргументов)
+            change_boost = Decimal("0")
+            if ticker_data.get("change_24h", 0) > 0.05:
+                change_boost = Decimal("1")  # +1 балл за сильный рост
+
+            return final_score + change_boost
+
+        except Exception as e:
+            logger.debug(f"Ошибка скоринга {symbol}: {e}")
+            return Decimal("0")
+
+    def get_usdt_balance(self):
+        """Получение баланса USDT"""
+        try:
+            balance = self.exchange.fetch_balance(params={"type": "spot"})
+            # Ищем USDT в разных местах
+            if "free" in balance and "USDT" in balance["free"]:
+                return Decimal(str(balance["free"]["USDT"]))
+            if "USDT" in balance and "free" in balance["USDT"]:
+                return Decimal(str(balance["USDT"]["free"]))
+            return Decimal("0")
+        except Exception as e:
+            logger.error(f"❌ Ошибка баланса: {e}")
+            return Decimal("0")
+
+    def get_current_portfolio(self):
+        portfolio = {}
+        if self.db_conn:
+            with self.db_conn.cursor() as cur:
+                cur.execute(
+                    "SELECT symbol, quantity, entry_price, entry_time, current_price FROM portfolio WHERE status = 'active'"
+                )
+                for row in cur.fetchall():
+                    symbol, qty, ep, et, cp = row
+                    portfolio[symbol] = {
+                        "quantity": Decimal(str(qty)),
+                        "entry_price": Decimal(str(ep)),
+                        "entry_time": et,
+                        "current_price": Decimal(str(cp if cp else 0)),
+                    }
+        return portfolio
+
+    def sync_portfolio_with_exchange(self):
+        try:
+            balance = self.exchange.fetch_balance(params={"type": "spot"})
+            if not self.db_conn:
+                return
+
+            db_active = set()
+            with self.db_conn.cursor() as cur:
+                cur.execute("SELECT symbol FROM portfolio WHERE status = 'active'")
+                db_active = {row[0] for row in cur.fetchall()}
+
+            real_balances = {}
+            for curr, data in balance.items():
+                if curr in [
+                    "free",
+                    "used",
+                    "total",
+                    "info",
+                    "timestamp",
+                    "datetime",
+                    "USDT",
+                ]:
+                    continue
+                if isinstance(data, dict):
+                    total = Decimal(str(data.get("total", 0)))
+                    if total > 0:
+                        real_balances[f"{curr}/USDT"] = total
+
+            # Sync Logic
+            with self.db_conn.cursor() as cur:
+                for sym, qty in real_balances.items():
+                    # Получаем цену
+                    try:
+                        ticker = self.exchange.fetch_ticker(sym.replace("/", ""))
+                        price = Decimal(str(ticker["last"]))
+                    except:
+                        price = Decimal("0")
+
+                    val = qty * price
+                    if val > Decimal("2"):  # Реальная позиция
+                        cur.execute(
+                            """
+                            INSERT INTO portfolio (symbol, quantity, entry_price, current_price, status)
+                            VALUES (%s, %s, %s, %s, 'active')
+                            ON CONFLICT (symbol) WHERE status = 'active'
+                            DO UPDATE SET quantity = EXCLUDED.quantity, current_price = EXCLUDED.current_price
+                        """,
+                            (sym, float(qty), float(price), float(price)),
+                        )
+                    elif sym in db_active:  # Пыль в БД
+                        cur.execute(
+                            "UPDATE portfolio SET status = 'closed' WHERE symbol = %s",
+                            (sym,),
+                        )
+                        logger.info(f"🧹 Убрана пыль {sym}")
+
+                for sym in db_active:
+                    if sym not in real_balances:
+                        cur.execute(
+                            "UPDATE portfolio SET status = 'closed' WHERE symbol = %s",
+                            (sym,),
+                        )
+
+            self.db_conn.commit()
+        except Exception as e:
+            logger.error(f"Ошибка синхронизации: {e}")
+
+    def auto_adjust_parameters(self):
+        """Адаптация под баланс"""
+        try:
+            real_balance = self.get_usdt_balance()
+            active_pos = len(self.get_current_portfolio())
+
+            if real_balance < Decimal("20"):
+                self.max_positions = 1
+                self.reserve_cash = Decimal("1")
+                available = real_balance - self.reserve_cash
+
+                # Sniper Mode: Если есть позиция - стоп. Если нет - All in.
+                if active_pos >= 1:
+                    self.min_position_size = Decimal("999999")
+                else:
+                    self.min_position_size = max(Decimal("5.5"), available)
+
+            elif real_balance < Decimal("80"):
+                self.max_positions = 2
+                self.reserve_cash = Decimal("2")
+                share = (real_balance - self.reserve_cash) / 2
+                self.min_position_size = share * Decimal("0.9")
+
+            else:
+                self.max_positions = 3
+                self.reserve_cash = Decimal("5")
+                share = (real_balance - self.reserve_cash) / 3
+                self.min_position_size = share * Decimal("0.9")
+
+        except Exception as e:
+            logger.error(f"Ошибка настройки: {e}")
+
+    # --- МЕТОД 4 & 5: TIME DECAY + SMART DCA ---
+    def check_stop_conditions(self, portfolio, tickers):
+        """Проверка условий выхода (Time Decay) и докупки (DCA)."""
+        positions_to_sell = []
+        dca_candidates = []  # Кандидаты на докупку
+
+        for symbol, position in portfolio.items():
+            if symbol in tickers:
+                current_price = tickers[symbol]["price"]
+            else:
+                try:
+                    ticker = self.exchange.fetch_ticker(symbol.replace("/", ""))
+                    current_price = Decimal(str(ticker["last"]))
+                except:
+                    continue
+
+            entry_price = position["entry_price"]
+            entry_time = position.get("entry_time") or datetime.now()
+
+            # Исправление таймзоны
+            now = datetime.now()
+            delta = now - entry_time
+            # Если дельта странная (отрицательная или > 30 дней для новой), сбрасываем
+            if delta.total_seconds() < 0 or delta.days > 30:
+                hours_held = 0
+            else:
+                hours_held = delta.total_seconds() / 3600
+
+            position_value = position["quantity"] * current_price
+            if position_value < Decimal("1"):
+                continue
+
+            pnl_ratio = current_price / entry_price
+            pnl_pct = (pnl_ratio - 1) * 100
+
+            # --- 1. SMART DCA (Только для депозитов > $80) ---
+            # Если упали на -5%...-10%, RSI перепродан, и у нас есть деньги
+            if self.get_usdt_balance() > Decimal("40") and self.max_positions > 1:
+                if pnl_ratio < Decimal("0.95") and pnl_ratio > Decimal("0.85"):
+                    rsi = self.calculate_rsi(symbol)
+                    if rsi < Decimal("35"):  # Перепроданность
+                        logger.info(
+                            f"💡 Сигнал DCA для {symbol}: Просадка {pnl_pct:.2f}%, RSI {rsi}"
+                        )
+                        # Мы не добавляем в positions_to_sell, мы выходим (hold)
+                        # В полной версии тут вызывался бы buy, но пока просто держим
+                        continue
+
+            # --- 2. TIME-BASED DECAY (Динамический тейк) ---
+            # Чем дольше держим, тем меньше хотим прибыли
+            target_profit = Decimal("1.08")  # База 8%
+
+            if hours_held > 2:
+                target_profit = Decimal("1.05")  # 5%
+            if hours_held > 6:
+                target_profit = Decimal("1.02")  # 2%
+            if hours_held > 12:
+                target_profit = Decimal("1.005")  # 0.5% (выход в 0)
+            if hours_held > 24:
+                target_profit = Decimal("0.99")  # -1% (надоело ждать)
+
+            # --- ПРОВЕРКИ ВЫХОДА ---
+
+            # Тейк-профит (Динамический)
+            if pnl_ratio >= target_profit:
+                reason = (
+                    f"ТЕЙК (Time-Decay: >{int(hours_held)}h)"
+                    if hours_held > 2
+                    else "ТЕЙК-ПРОФИТ"
+                )
+                positions_to_sell.append(
+                    (symbol, position, current_price, f"{reason} ({pnl_pct:.2f}%)")
+                )
+                continue
+
+            # Стоп-лосс (Фиксированный -6%)
+            if pnl_ratio <= Decimal("0.94"):
+                positions_to_sell.append(
+                    (symbol, position, current_price, f"СТОП-ЛОСС ({pnl_pct:.2f}%)")
+                )
+                continue
+
+            # Трейлинг (Если выросли > 3%)
+            if pnl_ratio > Decimal("1.03"):
+                if symbol not in self.trailing_stop_max_prices:
+                    self.trailing_stop_max_prices[symbol] = current_price
+                else:
+                    if current_price > self.trailing_stop_max_prices[symbol]:
+                        self.trailing_stop_max_prices[symbol] = current_price
+
+                trigger = self.trailing_stop_max_prices[symbol] * Decimal("0.98")
+                if current_price <= trigger:
+                    positions_to_sell.append(
+                        (symbol, position, current_price, "ТРЕЙЛИНГ-СТОП")
+                    )
+                    continue
+
+        return positions_to_sell
+
+    def find_optimized_opportunities(self, tickers, portfolio):
+        """Поиск с учетом Cooldown."""
+        opportunities = []
+
+        # Cooldown (не покупать проданное 60 мин)
+        recent_sells = set()
+        if self.db_conn:
+            with self.db_conn.cursor() as cur:
+                cur.execute(
+                    "SELECT symbol FROM portfolio WHERE status='closed' AND exit_time > NOW() - INTERVAL '60 minutes'"
+                )
+                recent_sells = {row[0] for row in cur.fetchall()}
+
+        categories = self.analyze_portfolio_diversification(portfolio, tickers)
+
+        logger.info("🔍 АНАЛИЗ РЫНОЧНЫХ ВОЗМОЖНОСТЕЙ...")
+
+        for symbol, data in tickers.items():
+            if symbol in portfolio:
+                continue
+            if symbol in recent_sells:
+                continue  # Cooldown
+
+            score = data.get("score", Decimal("0"))
+            price = data["price"]
+
+            # Базовые фильтры
+            if data["volume"] < Decimal("50000"):
+                continue
+            if self.calculate_atr(symbol) > Decimal("0.15"):
+                continue
+
+            # Категории
+            cat = "high_cap"
+            if price < 0.01:
+                cat = "micro_cap"
+            elif price < 10:
+                cat = "mid_cap"
+
+            bonus = Decimal("0")
+            if categories.get(cat, 0) == 0:
+                bonus = Decimal("2")
+
+            opportunities.append((symbol, score + bonus, price, cat))
+
+        opportunities.sort(key=lambda x: x[1], reverse=True)
+        logger.info(f"   Найдено возможностей: {len(opportunities)}")
+        return opportunities[:15]
+
+    def analyze_portfolio_diversification(self, portfolio, tickers):
+        counts = {}
+        for s, p in portfolio.items():
+            # Упрощенная логика категорий
+            counts["any"] = counts.get("any", 0) + 1
+        return counts
+
+    def get_cached_tickers(self):
+        if (
+            not self.cached_tickers
+            or time.time() - (self.last_tickers_update or 0) > 60
+        ):
+            self.cached_tickers = self.safe_fetch_filtered_tickers()
+            self.last_tickers_update = time.time()
+        return self.cached_tickers
+
+    def safe_fetch_filtered_tickers(self):
+        try:
+            tickers = self.exchange.fetch_tickers()
+            candidates = []
+            for s, t in tickers.items():
+                if not s.endswith("/USDT"):
+                    continue
+                if t["quoteVolume"] is None or t["last"] is None:
+                    continue
+
+                vol = Decimal(str(t["quoteVolume"]))
+                if vol < Decimal("50000"):
+                    continue
+
+                change = Decimal(str(t.get("percentage", 0)))
+                price = Decimal(str(t["last"]))
+
+                candidates.append(
+                    {"symbol": s, "price": price, "volume": vol, "change_24h": change}
+                )
+
+            # Отбираем топ-40 по объему и росту
+            candidates.sort(key=lambda x: x["volume"], reverse=True)
+            top_vol = candidates[:40]
+            candidates.sort(key=lambda x: x["change_24h"], reverse=True)
+            top_gain = candidates[:30]
+
+            unique = {c["symbol"]: c for c in top_vol + top_gain}.values()
+            filtered = {}
+
+            for cand in unique:
+                time.sleep(0.1)  # Rate limit
+                score = self.calculate_advanced_score(cand)
+                if score > Decimal("5"):
+                    cand["score"] = score
+                    filtered[cand["symbol"]] = cand
+                    logger.info(f"   ⭐ {cand['symbol']}: Score {score:.1f}")
+
+            return filtered
+        except Exception as e:
+            logger.error(f"Ошибка тикеров: {e}")
+            return {}
+
+    def cleanup_invalid_symbols(self):
+        pass  # Заглушка, логика есть в sync
+
+    def cleanup_dust_positions(self):
+        pass  # Логика перенесена в sync
+
+    def cleanup_old_cache(self):
+        curr = time.time()
+        keys = [
+            k for k, v in self.atr_cache.items() if curr - v[0] > self.atr_cache_ttl
+        ]
+        for k in keys:
+            del self.atr_cache[k]
+
+    def health_check(self):
+        return True
+
+    def log_initial_portfolio(self):
+        p = self.get_current_portfolio()
+        logger.info(f"📊 Портфель: {len(p)} позиций")
+
+    # --- MAIN LOOP ---
+    def enhanced_rebalance(self, iteration):
+        try:
+            if iteration <= 1:
+                logger.info("🔄 Обновление тикеров...")
+                self.cached_tickers = self.safe_fetch_filtered_tickers()
+
+            logger.info(f"🔄 Итерация #{iteration}")
+            self.auto_adjust_parameters()
+            self.sync_portfolio_with_exchange()
+
+            balance = self.get_usdt_balance()
+            portfolio = self.get_current_portfolio()
+            tickers = self.get_cached_tickers()
+
+            # 1. Рыночный режим
+            market_status = self.get_market_regime()
+            logger.info(f"🌍 Рынок (BTC): {market_status}")
+
+            # Логирование
+            real_pos = []
+            for s, p in portfolio.items():
+                val = p["quantity"] * p["current_price"]
+                if val > 2:
+                    real_pos.append(s)
+
+            logger.info(
+                f"📊 СТАТУС: Баланс {balance} | Позиций {len(real_pos)}/{self.max_positions}"
+            )
+            for s in real_pos:
+                p = portfolio[s]
+                pnl = (p["current_price"] / p["entry_price"] - 1) * 100
+                logger.info(f"   💎 {s}: {pnl:.2f}% | Цена {p['current_price']}")
+
+            # ПРОДАЖА
+            to_sell = self.check_stop_conditions(portfolio, tickers)
+            for sym, pos, price, reason in to_sell:
+                logger.info(f"🔻 Продажа {sym}: {reason}")
+                if self.smart_order_manager.execute_smart_sell(
+                    sym, pos["quantity"], price
+                ):
+                    # Запись в БД
+                    q = float(pos["quantity"])
+                    ep = float(pos["entry_price"])
+                    cp = float(price)
+                    pnl = (cp - ep) * q
+
+                    with self.db_conn.cursor() as cur:
+                        cur.execute(
+                            """
+                            UPDATE portfolio SET status='closed', exit_price=%s, exit_time=NOW(), profit_loss=%s
+                            WHERE symbol=%s AND status='active'
+                        """,
+                            (cp, pnl, sym),
+                        )
+                    self.db_conn.commit()
+                    logger.info(f"✅ Закрыто: {sym} (PnL {pnl:.4f})")
+
+            # ПОКУПКА
+            # Пересчет после продаж
+            balance = self.get_usdt_balance()
+            portfolio = self.get_current_portfolio()
+
+            # Считаем реальные слоты
+            busy_slots = len(
+                [
+                    k
+                    for k, v in portfolio.items()
+                    if v["quantity"] * v["current_price"] > 2
+                ]
+            )
+
+            if busy_slots < self.max_positions and balance > self.min_position_size:
+                if market_status == "danger":
+                    logger.info("🔥 Рынок перегрет, не покупаем")
+                    return True
+
+                opps = self.find_optimized_opportunities(tickers, portfolio)
+                for sym, score, price, cat in opps:
+                    # RSI Фильтр
+                    if self.calculate_rsi(sym) > Decimal("75"):
+                        logger.info(f"⚠️ {sym} RSI перегрет")
+                        continue
+
+                    # Медвежий фильтр (строже отбор)
+                    if market_status == "bear" and score < Decimal("8"):
+                        continue
+
+                    # Размер позиции
+                    amount = self.min_position_size
+                    if self.max_positions == 1:
+                        amount = balance - self.reserve_cash
+
+                    logger.info(f"🛒 Покупка {sym} ({amount:.2f} USDT)")
+                    if self.smart_order_manager.execute_smart_buy(sym, amount):
+                        logger.info("✅ Куплено")
+                        break  # 1 покупка за цикл
+            else:
+                logger.info("💤 Нет слотов или средств")
+
+            return True
+        except Exception as e:
+            logger.error(f"Ошибка цикла: {e}")
+            import traceback
+
+            logger.error(traceback.format_exc())
+            return False
 
 
 if __name__ == "__main__":
