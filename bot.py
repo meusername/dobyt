@@ -14,10 +14,14 @@ import psycopg2
 from dotenv import load_dotenv
 
 # Настройка логирования
-logging.basicConfig(
+ogging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
+    handlers=[
+        logging.FileHandler("dobyt.log", encoding="utf-8"),  # Пишет в файл
+        logging.StreamHandler(),  # Пишет в консоль
+    ],
 )
 logger = logging.getLogger(__name__)
 
@@ -83,13 +87,13 @@ class SmartOrderManager:
 
     def execute_smart_buy(self, symbol, amount_usdt, max_slippage=Decimal("0.005")):
         """
-        Быстрая покупка. ИСПРАВЛЕНО: Уменьшен буфер цены до 0.1% для Bybit.
+        Быстрая покупка. ИСПРАВЛЕНО: Уменьшен буфер цены до 0.15% для Bybit.
         """
         try:
             orderbook = self.exchange.fetch_order_book(symbol, limit=5)
             best_ask = float(orderbook["asks"][0][0])
 
-            # ИСПРАВЛЕНО: 0.1% вместо 0.5%, чтобы не ловить ошибку 'Price too high'
+            # ИСПРАВЛЕНО: 0.15% вместо 0.5%, чтобы не ловить ошибку 'Price too high'
             buy_price = best_ask * 1.0015
 
             # Буфер USDT на комиссию
@@ -130,7 +134,7 @@ class SmartOrderManager:
         self, symbol, quantity, current_price=None, max_slippage=Decimal("0.005")
     ):
         """
-        Умная продажа. ИСПРАВЛЕНО: Уменьшен буфер цены до 0.1%.
+        Умная продажа. ИСПРАВЛЕНО: Уменьшен буфер цены до 0.15%.
         """
         try:
             base_currency = symbol.split("/")[0]
@@ -518,34 +522,6 @@ class BybitSpotBot:
         except Exception as e:
             logger.error(f"❌ Ошибка подключения к БД: {e}")
             return None
-
-    def calculate_rsi(self, symbol, period=14):
-        """
-        Расчет RSI для фильтрации перекупленных активов.
-        Таймфрейм 15m для краткосрочных входов.
-        """
-        try:
-            # Берем 100 свечей, чтобы хватило для сглаживания
-            ohlcv = self.exchange.fetch_ohlcv(symbol, "15m", limit=100)
-            if len(ohlcv) < period + 1:
-                return Decimal("50")  # Нейтральное значение при ошибке
-
-            closes = [float(x[4]) for x in ohlcv]
-            df = pd.Series(closes)
-            delta = df.diff()
-
-            # Разделяем на положительные и отрицательные изменения
-            gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
-            loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
-
-            # Избегаем деления на ноль
-            rs = gain / loss.replace(0, 0.0000001)
-            rsi = 100 - (100 / (1 + rs))
-
-            return Decimal(str(rsi.iloc[-1]))
-        except Exception as e:
-            logger.warning(f"⚠️ Ошибка расчета RSI для {symbol}: {e}")
-            return Decimal("50")
 
     def calculate_atr(self, symbol, period=14):
         """Расчет Average True Range"""
@@ -1179,102 +1155,9 @@ class BybitSpotBot:
                 categories_count[category] = categories_count.get(category, 0) + 1
         return categories_count
 
-    def check_stop_conditions(self, portfolio, tickers):
-        """Проверка стоп-условий с исправлением Timezone."""
-        positions_to_sell = []
-        for symbol, position in portfolio.items():
-            if symbol in tickers:
-                current_price = tickers[symbol]["price"]
-            else:
-                try:
-                    ticker = self.exchange.fetch_ticker(symbol.replace("/", ""))
-                    current_price = Decimal(str(ticker.get("last", 0)))
-                except:
-                    current_price = position.get("current_price", Decimal("0"))
-
-            entry_price = position["entry_price"]
-
-            # --- FIX TIMEZONE ---
-            # Приводим все к UTC или к naive (без таймзоны), чтобы разница была верной
-            entry_time = position.get("entry_time")
-            now = datetime.now()
-
-            # Если entry_time нет, считаем что только что вошли
-            if not entry_time:
-                entry_time = now
-
-            # Расчет времени удержания (игнорируем таймзоны для простоты сравнения)
-            # Если в БД время сохраняется как UTC, а now - локальное, может быть сдвиг.
-            # Самый надежный способ - смотреть разницу в секундах, если она адекватна.
-
-            # Если entry_time "из будущего" (из-за часовых поясов), корректируем
-            if entry_time > now:
-                hold_time = timedelta(seconds=0)
-            else:
-                hold_time = now - entry_time
-
-            # Корректировка: если разница больше 24 часов при свежей сделке - это баг таймзоны.
-            # Но проще просто увеличить лимит или использовать UTC везде.
-            # Временное решение: если hold_time > 4 часа, но мы знаем что бот работает 5 минут - это баг.
-            # Просто проверяем условие:
-
-            position_value = position["quantity"] * current_price
-            if position_value < Decimal("1"):
-                continue
-
-            pnl_ratio = current_price / entry_price
-
-            # Стоп-лосс (расширен до 6%)
-            if pnl_ratio <= Decimal("0.94"):
-                positions_to_sell.append(
-                    (symbol, position, current_price, f"СТОП-ЛОСС ({pnl_ratio:.4f})")
-                )
-                continue
-
-            # Тейк-профит (расширен до 8%)
-            if pnl_ratio >= Decimal("1.08"):
-                positions_to_sell.append(
-                    (symbol, position, current_price, f"ТЕЙК-ПРОФИТ ({pnl_ratio:.4f})")
-                )
-                continue
-
-            # Трейлинг (активация после +2%)
-            if pnl_ratio > Decimal("1.02"):
-                if symbol not in self.trailing_stop_max_prices:
-                    self.trailing_stop_max_prices[symbol] = current_price
-                else:
-                    if current_price > self.trailing_stop_max_prices[symbol]:
-                        self.trailing_stop_max_prices[symbol] = current_price
-
-                trailing_trigger = self.trailing_stop_max_prices[symbol] * Decimal(
-                    "0.98"
-                )  # Откат 2% от пика
-                if current_price <= trailing_trigger:
-                    positions_to_sell.append(
-                        (symbol, position, current_price, f"ТРЕЙЛИНГ-СТОП")
-                    )
-                    continue
-
-            # Время истекло (Увеличено до 12 часов + проверка на адекватность)
-            # Если hold_time показывает > 7 часов сразу после покупки - это баг таймзоны.
-            # Добавим проверку: продаем по времени, только если PnL слабый (-1% ... +1%)
-            if hold_time > timedelta(hours=12):
-                # Если прошло реально много времени, а мы никуда не ушли - выход
-                if Decimal("0.99") < pnl_ratio < Decimal("1.01"):
-                    positions_to_sell.append(
-                        (
-                            symbol,
-                            position,
-                            current_price,
-                            f"ВРЕМЯ ИСТЕКЛО ({hold_time})",
-                        )
-                    )
-
-        return positions_to_sell
-
     def enhanced_rebalance(self, iteration):
         """
-        Исправленная ребалансировка: RSI фильтр + Ускорение + Фикс БД.
+        Исправленная ребалансировка: RSI + Cooldown + Исправленная запись в БД.
         """
         try:
             if iteration <= 3:
@@ -1285,10 +1168,8 @@ class BybitSpotBot:
             if iteration == 1 or iteration % 10 == 0:
                 logger.info(f"🔄 Ребалансировка (итерация #{iteration})")
 
-            # 1. Адаптация параметров (тут сработает режим <$20)
             self.auto_adjust_parameters()
 
-            # 2. Синхронизация (чистит пыль)
             logger.info("🔄 Синхронизация портфеля...")
             self.sync_portfolio_with_exchange()
 
@@ -1296,18 +1177,17 @@ class BybitSpotBot:
             tickers = self.get_cached_tickers()
             current_portfolio = self.get_current_portfolio()
 
-            # 3. Логирование статуса (только реальные позиции)
+            # Логируем только реальные позиции > $2
             real_pos = [
                 k
                 for k, v in current_portfolio.items()
                 if (v["quantity"] * v["current_price"]) > Decimal("2")
             ]
-
             logger.info("📊 ТЕКУЩИЙ СТАТУС:")
             logger.info(f"   💰 Баланс: {available_balance:.2f} USDT")
             logger.info(f"   📦 Позиций: {len(real_pos)}/{self.max_positions}")
 
-            # --- БЛОК ПРОДАЖИ ---
+            # --- ПРОДАЖА ---
             positions_to_sell = self.check_stop_conditions(current_portfolio, tickers)
 
             if positions_to_sell:
@@ -1320,29 +1200,37 @@ class BybitSpotBot:
                     )
 
                     if success:
-                        # Сразу чистим БД
+                        # Рассчитываем PnL для записи
+                        quantity = Decimal(str(position["quantity"]))
+                        entry_price = Decimal(str(position["entry_price"]))
+                        curr_price_dec = Decimal(str(current_price))
+
+                        pnl = (curr_price_dec - entry_price) * quantity
+                        pnl_pct = (curr_price_dec / entry_price) - Decimal("1")
+
+                        # !!! ВАЖНО: Обновляем БД с прибылью и временем !!!
                         with self.db_conn.cursor() as cur:
                             cur.execute(
-                                "UPDATE portfolio SET status = 'closed' WHERE symbol = %s",
-                                (symbol,),
+                                """
+                                    UPDATE portfolio
+                                    SET status = 'closed',
+                                        exit_price = %s,
+                                        exit_time = NOW(),
+                                        profit_loss = %s
+                                    WHERE symbol = %s AND status = 'active'
+                                """,
+                                (float(curr_price_dec), float(pnl), symbol),
                             )
                         self.db_conn.commit()
 
-                        # Статистика
-                        pnl = (current_price - position["entry_price"]) * position[
-                            "quantity"
-                        ]
-                        pnl_pct = (current_price / position["entry_price"]) - Decimal(
-                            "1"
-                        )
-
+                        # Аналитика
                         self.performance_analytics.add_trade(
                             {
                                 "symbol": symbol,
                                 "side": "sell",
-                                "quantity": position["quantity"],
-                                "entry_price": position["entry_price"],
-                                "exit_price": current_price,
+                                "quantity": quantity,
+                                "entry_price": entry_price,
+                                "exit_price": curr_price_dec,
                                 "pnl": pnl,
                                 "pnl_pct": pnl_pct,
                                 "commission": 0,
@@ -1351,16 +1239,17 @@ class BybitSpotBot:
                         self.kelly_manager.update_trade_history(
                             {"pnl": pnl, "pnl_pct": pnl_pct}
                         )
-                        logger.info(f"   ✅ Продано: {symbol}")
+
+                        logger.info(
+                            f"   ✅ Продано и сохранено: {symbol} | PnL: {pnl:.4f} USDT"
+                        )
                     else:
                         logger.error(f"   ❌ Ошибка продажи: {symbol}")
 
-                # Обновляем баланс после продаж
                 available_balance = self.get_usdt_balance()
                 current_portfolio = self.get_current_portfolio()
 
-            # --- БЛОК ПОКУПКИ ---
-            # Пересчитываем слоты
+            # --- ПОКУПКА ---
             real_positions_count = 0
             for sym, pos in current_portfolio.items():
                 if (pos["quantity"] * pos["current_price"]) > Decimal("2"):
@@ -1373,52 +1262,42 @@ class BybitSpotBot:
             if target_size is None:
                 target_size = Decimal("10")
 
-            # Если у нас $13, режим снайпера (max_positions=1), и нет позиций -> можно торговать
             can_trade = available_for_trading >= target_size
 
             if can_trade and has_free_slots:
                 logger.info("🎯 ПОИСК ТОРГОВЫХ ВОЗМОЖНОСТЕЙ...")
+                # Здесь теперь работает Cooldown
                 best_opportunities = self.find_optimized_opportunities(
                     tickers, current_portfolio
                 )
 
                 bought_count = 0
-                # Разрешаем купить до 3 монет за цикл, если позволяет депозит и слоты
                 max_buys_per_cycle = 3
 
                 for symbol, score, price, category in best_opportunities:
                     if bought_count >= max_buys_per_cycle:
                         break
-
-                    # Если включен режим снайпера (1 позиция), и мы уже что-то купили в этом цикле -> стоп
                     if self.max_positions == 1 and bought_count >= 1:
                         break
 
-                    # Базовый фильтр по скору
                     if score < Decimal("6"):
                         continue
 
-                    # === НОВЫЙ ФИЛЬТР RSI ===
+                    # === RSI ФИЛЬТР ===
                     rsi = self.calculate_rsi(symbol)
-                    # Если RSI > 75, пропускаем (слишком горячо)
                     if rsi > Decimal("75"):
-                        logger.info(
-                            f"   ⚠️ Пропуск {symbol}: Перекуплен (RSI {rsi:.2f})"
-                        )
+                        logger.info(f"   ⚠️ Пропуск {symbol}: RSI перегрет ({rsi:.1f})")
                         continue
-                    # ========================
 
                     if available_for_trading < target_size:
                         break
 
-                    # Расчет объема
                     buy_amount = target_size
                     if self.max_positions == 1:
-                        # Если позиция одна, берем все доступное
                         buy_amount = available_for_trading
 
                     logger.info(
-                        f"🛒 ПОПЫТКА ПОКУПКИ {symbol} на {buy_amount:.2f} USDT (Score: {score:.1f}, RSI: {rsi:.1f})"
+                        f"🛒 ПОПЫТКА ПОКУПКИ {symbol} на {buy_amount:.2f} USDT (RSI: {rsi:.1f})"
                     )
 
                     success = self.smart_order_manager.execute_smart_buy(
@@ -1429,27 +1308,22 @@ class BybitSpotBot:
                         bought_count += 1
                         available_for_trading -= buy_amount
                         logger.info(f"✅ УСПЕШНАЯ ПОКУПКА: {symbol}")
-
-                        # Для режима снайпера сразу прерываем цикл, денег больше нет
                         if self.max_positions == 1:
                             break
                     else:
                         logger.error(f"❌ ОШИБКА ПОКУПКИ: {symbol}")
-
             else:
                 if not can_trade:
                     logger.info(
-                        f"💤 Недостаточно средств ({available_for_trading:.2f} < {target_size:.2f})"
+                        f"💤 Ждем средств ({available_for_trading:.2f} < {target_size:.2f})"
                     )
                 if not has_free_slots:
                     logger.info(
                         f"📦 Нет слотов ({real_positions_count}/{self.max_positions})"
                     )
 
-            # Отчет раз в сутки
             if iteration % 288 == 0:
                 self.performance_analytics.generate_performance_report()
-
             self.cleanup_old_cache()
             return True
 
@@ -1582,58 +1456,179 @@ class BybitSpotBot:
         except Exception as e:
             logger.error(f"Ошибка автонастройки: {e}")
 
+    def calculate_rsi(self, symbol, period=14):
+        """Расчет RSI для фильтрации перекупленности."""
+        try:
+            ohlcv = self.exchange.fetch_ohlcv(symbol, "15m", limit=100)
+            if len(ohlcv) < period + 1:
+                return Decimal("50")
+
+            closes = [float(x[4]) for x in ohlcv]
+            df = pd.Series(closes)
+            delta = df.diff()
+
+            gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
+            loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
+
+            rs = gain / loss.replace(0, 0.0000001)
+            rsi = 100 - (100 / (1 + rs))
+            return Decimal(str(rsi.iloc[-1]))
+        except:
+            return Decimal("50")
+
+    def check_stop_conditions(self, portfolio, tickers):
+        """
+        Проверка стоп-условий.
+        ИСПРАВЛЕНО: Расширены стопы (6%/8%) и исправлен баг с Timezone.
+        """
+        positions_to_sell = []
+        for symbol, position in portfolio.items():
+            if symbol in tickers:
+                current_price = tickers[symbol]["price"]
+            else:
+                try:
+                    ticker = self.exchange.fetch_ticker(symbol.replace("/", ""))
+                    current_price = Decimal(str(ticker.get("last", 0)))
+                except:
+                    current_price = position.get("current_price", Decimal("0"))
+
+            entry_price = position["entry_price"]
+
+            # --- FIX TIMEZONE ---
+            # Считаем время удержания надежно (игнорируя баги таймзон)
+            entry_time = position.get("entry_time")
+            now = datetime.now()
+
+            if not entry_time:
+                entry_time = now
+
+            # Если разница во времени выглядит странно (отрицательная или > 24 часов для новой сделки),
+            # считаем, что прошло 0 времени.
+            delta = now - entry_time
+            if delta.days < 0 or delta.days > 100:
+                hold_time = timedelta(seconds=0)
+            else:
+                hold_time = delta
+
+            position_value = position["quantity"] * current_price
+            if position_value < Decimal("1"):
+                continue
+
+            pnl_ratio = current_price / entry_price
+
+            # 1. Стоп-лосс (расширен до -6% для защиты от шума)
+            if pnl_ratio <= Decimal("0.94"):
+                positions_to_sell.append(
+                    (symbol, position, current_price, f"СТОП-ЛОСС ({pnl_ratio:.4f})")
+                )
+                continue
+
+            # 2. Тейк-профит (расширен до +8%)
+            if pnl_ratio >= Decimal("1.08"):
+                positions_to_sell.append(
+                    (symbol, position, current_price, f"ТЕЙК-ПРОФИТ ({pnl_ratio:.4f})")
+                )
+                continue
+
+            # 3. Трейлинг (включаем только если есть прибыль +3%)
+            if pnl_ratio > Decimal("1.03"):
+                if symbol not in self.trailing_stop_max_prices:
+                    self.trailing_stop_max_prices[symbol] = current_price
+                else:
+                    if current_price > self.trailing_stop_max_prices[symbol]:
+                        self.trailing_stop_max_prices[symbol] = current_price
+
+                # Откат 2% от максимума
+                trailing_trigger = self.trailing_stop_max_prices[symbol] * Decimal(
+                    "0.98"
+                )
+                if current_price <= trailing_trigger:
+                    positions_to_sell.append(
+                        (symbol, position, current_price, f"ТРЕЙЛИНГ-СТОП")
+                    )
+                    continue
+
+            # 4. Время истекло (12 часов).
+            # Продаем только если мы около нуля, чтобы не сидеть в мертвой монете вечно.
+            if hold_time > timedelta(hours=12):
+                if Decimal("0.98") < pnl_ratio < Decimal("1.02"):
+                    positions_to_sell.append(
+                        (
+                            symbol,
+                            position,
+                            current_price,
+                            f"ВРЕМЯ ИСТЕКЛО ({hold_time})",
+                        )
+                    )
+
+        return positions_to_sell
+
     def find_optimized_opportunities(self, tickers, portfolio):
-        """Поиск оптимизированных торговых возможностей"""
+        """
+        Поиск возможностей с COOLDOWN фильтром.
+        """
         opportunities = []
 
-        # АНАЛИЗ ДИВЕРСИФИКАЦИИ
-        current_categories = self.analyze_portfolio_diversification(portfolio, tickers)
+        # 1. Получаем список монет, проданных за последние 60 минут
+        recent_sells = set()
+        if self.db_conn:
+            try:
+                with self.db_conn.cursor() as cur:
+                    cur.execute("""
+                        SELECT symbol FROM portfolio
+                        WHERE status = 'closed'
+                        AND exit_time > NOW() - INTERVAL '60 minutes'
+                    """)
+                    recent_sells = {row[0] for row in cur.fetchall()}
+            except Exception as e:
+                logger.error(f"Ошибка получения истории продаж: {e}")
 
+        current_categories = self.analyze_portfolio_diversification(portfolio, tickers)
         logger.info("🔍 АНАЛИЗ РЫНОЧНЫХ ВОЗМОЖНОСТЕЙ...")
 
         for symbol, data in tickers.items():
-            if symbol not in portfolio:
-                score = data.get("score", Decimal("0"))
-                price = data["price"]
+            if symbol in portfolio:
+                continue
 
-                # 🔴 ДОПОЛНИТЕЛЬНЫЕ ПРОВЕРКИ
-                # Проверка ликвидности
-                if data["volume"] < Decimal("50000"):  # Минимум $50k объема
-                    continue
+            # === COOLDOWN ФИЛЬТР ===
+            if symbol in recent_sells:
+                # Логируем только если это топ монета, чтобы не спамить
+                if data.get("score", 0) > 8:
+                    logger.info(f"❄️ Cooldown: пропускаем {symbol} (недавно продана)")
+                continue
 
-                # Проверка волатильности через ATR
-                atr = self.calculate_atr(symbol)
-                if atr > Decimal("0.15"):  # Слишком высокая волатильность
-                    continue
+            score = data.get("score", Decimal("0"))
+            price = data["price"]
 
-                # Определение категории актива
-                category = "unknown"
-                if price < Decimal("0.01"):
-                    category = "micro_cap"
-                elif price < Decimal("1"):
-                    category = "low_cap"
-                elif price < Decimal("10"):
-                    category = "mid_cap"
-                else:
-                    category = "high_cap"
+            if data["volume"] < Decimal("50000"):
+                continue
 
-                # 🔴 БОНУС ЗА ДИВЕРСИФИКАЦИЮ
-                diversification_bonus = Decimal("0")
-                if current_categories.get(category, 0) == 0:
-                    diversification_bonus = Decimal("3")  # Новая категория
-                elif current_categories.get(category, 0) <= 1:
-                    diversification_bonus = Decimal("1")  # Мало позиций в категории
+            atr = self.calculate_atr(symbol)
+            if atr > Decimal("0.15"):
+                continue
 
-                final_score = score + diversification_bonus
+            category = "unknown"
+            if price < Decimal("0.01"):
+                category = "micro_cap"
+            elif price < Decimal("1"):
+                category = "low_cap"
+            elif price < Decimal("10"):
+                category = "mid_cap"
+            else:
+                category = "high_cap"
 
-                opportunities.append((symbol, final_score, price, category))
+            diversification_bonus = Decimal("0")
+            if current_categories.get(category, 0) == 0:
+                diversification_bonus = Decimal("3")
+            elif current_categories.get(category, 0) <= 1:
+                diversification_bonus = Decimal("1")
 
-        # СОРТИРОВКА ПО SCORE
+            final_score = score + diversification_bonus
+            opportunities.append((symbol, final_score, price, category))
+
         opportunities.sort(key=lambda x: x[1], reverse=True)
-
-        logger.info(f"   Найдено возможностей: {len(opportunities)}")
-
-        return opportunities[:10]  # Возвращаем топ-10
+        logger.info(f"   Найдено возможностей (после фильтров): {len(opportunities)}")
+        return opportunities[:10]
 
     def cleanup_old_cache(self):
         """Очистка устаревших данных кэша"""
